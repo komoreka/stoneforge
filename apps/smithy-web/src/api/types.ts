@@ -632,6 +632,12 @@ export interface DispatchHealth {
   stuck: boolean;
   hasStuckQueue: boolean;
   computedAt: string;
+  /** ISO timestamp when the most recent poll cycle started. Undefined if no cycle has ever started. */
+  lastPollStartedAt?: string;
+  /** ISO timestamp when the most recent poll cycle completed. Undefined if no cycle has completed. */
+  lastPollCompletedAt?: string;
+  /** True when the daemon is responsive but its poll loop is wedged or has not advanced past the staleness threshold. */
+  pollStale: boolean;
 }
 
 // ============================================================================

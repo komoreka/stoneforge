@@ -6646,3 +6646,119 @@ describe('stuck-queue transition logging', () => {
     }
   });
 });
+
+// ============================================================================
+// getDispatchHealth — pollStale detection
+// ============================================================================
+
+describe('getDispatchHealth - pollStale detection', () => {
+  test('reports lastPollCompletedAt fresh and pollStale=false right after a successful poll cycle', async () => {
+    const harness = await setupDaemonHarness();
+    try {
+      await harness.daemon.tick();
+      const health = await harness.daemon.getDispatchHealth();
+      expect(health.lastPollCompletedAt).toBeDefined();
+      expect(health.lastPollStartedAt).toBeDefined();
+      expect(health.pollStale).toBe(false);
+      // lastPollCompletedAt should be within the last second
+      const ageMs = Date.now() - new Date(health.lastPollCompletedAt!).getTime();
+      expect(ageMs).toBeLessThan(1000);
+    } finally {
+      await harness.dispose();
+    }
+  });
+
+  test('reports pollStale=false and undefined timestamps when daemon has never polled', async () => {
+    const harness = await setupDaemonHarness();
+    try {
+      // Don't call tick() — daemon is constructed but never polled.
+      const health = await harness.daemon.getDispatchHealth();
+      expect(health.lastPollStartedAt).toBeUndefined();
+      expect(health.lastPollCompletedAt).toBeUndefined();
+      // pollStale must be false when there's no baseline — we don't know if
+      // the daemon has had a chance to poll yet, so we must not false-alarm.
+      expect(health.pollStale).toBe(false);
+    } finally {
+      await harness.dispose();
+    }
+  });
+
+  test('reports pollStale=true when a poll cycle is wedged past the threshold', async () => {
+    // Simulate a wedged cycle: stub api.ready (called by both pollWorkerAvailability
+    // and getDispatchHealth itself) to return a never-resolving promise on the
+    // first invocation only. Start tick() without awaiting, sleep past the
+    // (very short) threshold, then probe health via a second api.ready call
+    // that resolves normally.
+    const harness = await setupDaemonHarness({
+      configOverrides: {
+        // Override threshold to a tiny value so the test runs fast.
+        pollStaleThresholdMs: 50,
+        // Enable the worker-availability poll so api.ready actually gets called.
+        workerAvailabilityPollEnabled: true,
+      },
+    });
+    try {
+      // Wedge the first runPollCycle by making api.ready hang on the first call.
+      // Subsequent calls (e.g. from getDispatchHealth) must resolve quickly.
+      const realReady = harness.api.ready.bind(harness.api);
+      let callCount = 0;
+      const neverResolves = new Promise<never>(() => { /* never */ });
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (harness.api as any).ready = (filter?: unknown) => {
+        callCount += 1;
+        if (callCount === 1) return neverResolves;
+        return realReady(filter as never);
+      };
+
+      // Start tick() but don't await — the cycle wedges inside.
+      const wedgedTick = harness.daemon.tick();
+      void wedgedTick; // prevent unused-var lint
+
+      // Wait past the threshold (50ms) plus a margin. lastPollStartedAt was set
+      // at the top of runPollCycle, lastPollCompletedAt was NOT set because
+      // the finally block hasn't been reached yet.
+      await new Promise(r => setTimeout(r, 150));
+
+      const health = await harness.daemon.getDispatchHealth();
+      expect(health.pollStale).toBe(true);
+      expect(health.lastPollStartedAt).toBeDefined();
+      expect(health.lastPollCompletedAt).toBeUndefined();
+    } finally {
+      await harness.dispose();
+    }
+  });
+
+  test('honors a custom pollStaleThresholdMs from config', async () => {
+    // Default threshold is max(60_000, 10 × pollIntervalMs). With a custom
+    // override, a freshly-completed poll reports pollStale=false, but if we
+    // artificially push lastPollCompletedAt back past the override, pollStale
+    // flips true.
+    const harness = await setupDaemonHarness({
+      configOverrides: { pollStaleThresholdMs: 10 },
+    });
+    try {
+      await harness.daemon.tick();
+      // Right after tick: not stale.
+      let health = await harness.daemon.getDispatchHealth();
+      expect(health.pollStale).toBe(false);
+
+      // Force BOTH timestamps back 100ms (well past the 10ms threshold). In a
+      // real wedge both move together; pushing only one would simulate
+      // "cycle in flight" and trigger the in-flight branch instead of the
+      // completed-but-stale branch we want to exercise here.
+      // Cast through unknown to access private fields — acceptable for tests.
+      const daemon = harness.daemon as unknown as {
+        lastPollStartedAt: string;
+        lastPollCompletedAt: string;
+      };
+      const past = new Date(Date.now() - 100).toISOString();
+      daemon.lastPollStartedAt = past;
+      daemon.lastPollCompletedAt = past;
+
+      health = await harness.daemon.getDispatchHealth();
+      expect(health.pollStale).toBe(true);
+    } finally {
+      await harness.dispose();
+    }
+  });
+});
