@@ -644,32 +644,33 @@ function FilterSortDropdown({
               </div>
             )}
 
-            {/* Merge Status Filter (Awaiting Merge column only — mergeStatus is
-                meaningful in REVIEW state where the merge steward is processing
-                the task; pre-merge columns don't carry this metadata yet). */}
-            {columnId === 'awaiting_merge' && (
-              <div className="mb-1">
-                <label className="text-xs text-[var(--color-text-tertiary)] mb-1 block">Merge status</label>
-                <select
-                  value={preferences.filters.mergeStatus ?? ''}
-                  onChange={(e) => onUpdate({
-                    filters: {
-                      ...preferences.filters,
-                      mergeStatus: e.target.value || null,
-                    },
-                  })}
-                  className="w-full text-xs border border-[var(--color-border)] rounded px-2 py-1 focus:outline-none focus:ring-1 focus:ring-[var(--color-primary)] bg-[var(--color-input-bg)] text-[var(--color-text)]"
-                  data-testid={`${columnId}-filter-merge-status`}
-                >
-                  <option value="">All merge statuses</option>
-                  {MERGE_STATUS_OPTIONS.map((opt) => (
-                    <option key={opt.value} value={opt.value}>
-                      {opt.label}
-                    </option>
-                  ))}
-                </select>
-              </div>
-            )}
+            {/* Merge Status Filter (available on every column — mergeStatus is
+                set by the merge steward and lives on the task's orchestrator
+                metadata regardless of column. Operators may want to surface
+                e.g. tasks with mergeStatus='conflict' across all columns,
+                or filter Assigned to tasks whose previous attempt left a
+                stale mergeStatus). */}
+            <div className="mb-1">
+              <label className="text-xs text-[var(--color-text-tertiary)] mb-1 block">Merge status</label>
+              <select
+                value={preferences.filters.mergeStatus ?? ''}
+                onChange={(e) => onUpdate({
+                  filters: {
+                    ...preferences.filters,
+                    mergeStatus: e.target.value || null,
+                  },
+                })}
+                className="w-full text-xs border border-[var(--color-border)] rounded px-2 py-1 focus:outline-none focus:ring-1 focus:ring-[var(--color-primary)] bg-[var(--color-input-bg)] text-[var(--color-text)]"
+                data-testid={`${columnId}-filter-merge-status`}
+              >
+                <option value="">All merge statuses</option>
+                {MERGE_STATUS_OPTIONS.map((opt) => (
+                  <option key={opt.value} value={opt.value}>
+                    {opt.label}
+                  </option>
+                ))}
+              </select>
+            </div>
           </div>
         </div>
       )}
