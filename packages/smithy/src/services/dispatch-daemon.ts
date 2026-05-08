@@ -28,6 +28,7 @@ import type {
   Document,
   Plan,
   Workflow,
+  Timestamp,
 } from '@stoneforge/core';
 import { InboxStatus, createTimestamp, TaskStatus, asEntityId, asElementId, PlanStatus, canAutoComplete, WorkflowStatus, computeWorkflowStatus, updateWorkflowStatus } from '@stoneforge/core';
 import type { QuarryAPI, InboxService } from '@stoneforge/quarry';
@@ -576,6 +577,22 @@ export class DispatchDaemonImpl implements DispatchDaemon {
   private currentPollCycle?: Promise<void>;
   private rateLimitSleepTimer?: NodeJS.Timeout;
   private lastWakeAt?: number;
+  /**
+   * ISO timestamp when the most recent `runPollCycle` invocation entered the
+   * try block. Set BEFORE awaiting any work, so a wedged-mid-cycle daemon
+   * leaves this value old. Compared against `lastPollCompletedAt` and
+   * wall-clock to detect staleness in {@link getDispatchHealth}.
+   */
+  private lastPollStartedAt?: Timestamp;
+  /**
+   * ISO timestamp when the most recent `runPollCycle` invocation finished
+   * (whether it succeeded or threw). Set in the `finally` block. A wedged
+   * cycle never reaches this assignment, so the value remains old while
+   * `lastPollStartedAt` keeps updating only if the re-entrancy guard ever
+   * lets a new cycle start (it doesn't, by design). Surfaced via
+   * {@link getDispatchHealth} as the canonical "loop is alive" signal.
+   */
+  private lastPollCompletedAt?: Timestamp;
 
   /**
    * Tracks inbox item IDs that are currently being forwarded to persistent agents.
@@ -2150,6 +2167,7 @@ export class DispatchDaemonImpl implements DispatchDaemon {
   private async runPollCycle(): Promise<void> {
     if (this.polling) return;
     this.polling = true;
+    this.lastPollStartedAt = createTimestamp();
     try {
       // Check if dispatch is paused due to rate limiting.
       // When paused, skip dispatch-related polls but still run non-dispatch work.
@@ -2250,6 +2268,7 @@ export class DispatchDaemonImpl implements DispatchDaemon {
 
       await this.maybeLogStuckQueueWarning();
     } finally {
+      this.lastPollCompletedAt = createTimestamp();
       this.polling = false;
     }
   }
