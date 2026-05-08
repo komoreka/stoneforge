@@ -6703,12 +6703,12 @@ describe('getDispatchHealth - pollStale detection', () => {
       const realReady = harness.api.ready.bind(harness.api);
       let callCount = 0;
       const neverResolves = new Promise<never>(() => { /* never */ });
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (harness.api as any).ready = (filter?: unknown) => {
+      const stubbedApi = harness.api as { ready: typeof harness.api.ready };
+      stubbedApi.ready = ((filter?: Parameters<typeof realReady>[0]) => {
         callCount += 1;
         if (callCount === 1) return neverResolves;
-        return realReady(filter as never);
-      };
+        return realReady(filter);
+      }) as typeof harness.api.ready;
 
       // Start tick() but don't await — the cycle wedges inside.
       const wedgedTick = harness.daemon.tick();

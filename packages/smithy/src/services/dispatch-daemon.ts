@@ -618,10 +618,13 @@ export class DispatchDaemonImpl implements DispatchDaemon {
   /**
    * ISO timestamp when the most recent `runPollCycle` invocation finished
    * (whether it succeeded or threw). Set in the `finally` block. A wedged
-   * cycle never reaches this assignment, so the value remains old while
-   * `lastPollStartedAt` keeps updating only if the re-entrancy guard ever
-   * lets a new cycle start (it doesn't, by design). Surfaced via
-   * {@link getDispatchHealth} as the canonical "loop is alive" signal.
+   * cycle never reaches this assignment, so the value stays frozen at the
+   * previous successful completion (or undefined if no cycle has yet
+   * completed). Note that during a wedge, `lastPollStartedAt` also stops
+   * advancing because the re-entrancy guard at the top of `runPollCycle`
+   * bails on every subsequent setInterval tick — only the wedged cycle's
+   * own start-time is recorded. Surfaced via {@link getDispatchHealth}
+   * as the canonical "loop is alive" signal.
    */
   private lastPollCompletedAt?: Timestamp;
 
