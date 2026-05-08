@@ -163,6 +163,17 @@ export interface DispatchDaemonConfig {
   readonly pollIntervalMs?: number;
 
   /**
+   * Threshold in milliseconds beyond which `getDispatchHealth().pollStale`
+   * flips true if no poll cycle has completed. Detects a daemon whose
+   * `runPollCycle` is wedged mid-await (HTTP responsive but loop dead).
+   * Default: max(60000, 10 × pollIntervalMs).
+   * Set generously above any healthy poll cycle duration; orphan recovery
+   * + inbox triage + steward triggers can plausibly take 10+ seconds on a
+   * loaded workspace.
+   */
+  readonly pollStaleThresholdMs?: number;
+
+  /**
    * Whether worker availability polling is enabled.
    * Default: true
    */
@@ -318,6 +329,25 @@ export interface DispatchHealth {
   readonly hasStuckQueue: boolean;
   /** Timestamp the snapshot was computed (ISO 8601). */
   readonly computedAt: string;
+  /**
+   * Timestamp when the most recent poll cycle entered its try block (set BEFORE
+   * any await). Undefined if no cycle has ever started. Compared with
+   * `lastPollCompletedAt` and wall-clock to derive {@link pollStale}.
+   */
+  readonly lastPollStartedAt?: string;
+  /**
+   * Timestamp when the most recent poll cycle reached its `finally` block.
+   * Undefined if no cycle has completed yet. A wedged cycle leaves this old.
+   */
+  readonly lastPollCompletedAt?: string;
+  /**
+   * True when the daemon's HTTP server is alive but its poll loop has not
+   * completed a cycle within the configured staleness threshold. Indicates
+   * the daemon is wedged: process up, dispatch / scheduling / recovery down.
+   * Always false until a baseline `lastPollCompletedAt` exists, so a
+   * just-started daemon does not false-alarm.
+   */
+  readonly pollStale: boolean;
 }
 
 /**
@@ -343,6 +373,7 @@ export interface PollResult {
  */
 interface NormalizedConfig {
   pollIntervalMs: number;
+  pollStaleThresholdMs: number;
   workerAvailabilityPollEnabled: boolean;
   inboxPollEnabled: boolean;
   stewardTriggerPollEnabled: boolean;
@@ -800,12 +831,42 @@ export class DispatchDaemonImpl implements DispatchDaemon {
 
     const stuck = readyUnassignedTasks > 0 && availableWorkers === 0;
 
+    // pollStale catches two failure modes:
+    // 1) A cycle is currently in flight (startedAt exists and is newer than
+    //    completedAt, or completedAt doesn't exist at all) and has been
+    //    running for longer than the threshold. This is the wedged-mid-await
+    //    case observed in production.
+    // 2) No cycle is in flight, but the last completed cycle is older than
+    //    the threshold (i.e. setInterval stopped firing entirely — rarer,
+    //    since a frozen event loop would also stop responding to HTTP).
+    // If neither timestamp is set, pollStale stays false to avoid false-firing
+    // on a just-started daemon that hasn't had a chance to poll yet.
+    let pollStale = false;
+    const now = Date.now();
+    const threshold = this.config.pollStaleThresholdMs;
+    const startedAtMs = this.lastPollStartedAt
+      ? new Date(this.lastPollStartedAt).getTime()
+      : undefined;
+    const completedAtMs = this.lastPollCompletedAt
+      ? new Date(this.lastPollCompletedAt).getTime()
+      : undefined;
+    const cycleInFlight = startedAtMs !== undefined
+      && (completedAtMs === undefined || startedAtMs > completedAtMs);
+    if (cycleInFlight && startedAtMs !== undefined) {
+      pollStale = now - startedAtMs > threshold;
+    } else if (completedAtMs !== undefined) {
+      pollStale = now - completedAtMs > threshold;
+    }
+
     return {
       readyUnassignedTasks,
       availableWorkers,
       stuck,
       hasStuckQueue: stuck,
       computedAt: new Date().toISOString(),
+      lastPollStartedAt: this.lastPollStartedAt,
+      lastPollCompletedAt: this.lastPollCompletedAt,
+      pollStale,
     };
   }
 
@@ -2136,8 +2197,15 @@ export class DispatchDaemonImpl implements DispatchDaemon {
     let pollIntervalMs = config?.pollIntervalMs ?? DISPATCH_DAEMON_DEFAULT_POLL_INTERVAL_MS;
     pollIntervalMs = Math.max(DISPATCH_DAEMON_MIN_POLL_INTERVAL_MS, Math.min(DISPATCH_DAEMON_MAX_POLL_INTERVAL_MS, pollIntervalMs));
 
+    // Default staleness threshold: max(60s, 10× poll interval). 60s is well
+    // above any healthy cycle's expected duration; 10× protects users running
+    // with a custom long pollIntervalMs.
+    const pollStaleThresholdMs = config?.pollStaleThresholdMs
+      ?? Math.max(60_000, 10 * pollIntervalMs);
+
     return {
       pollIntervalMs,
+      pollStaleThresholdMs,
       workerAvailabilityPollEnabled: config?.workerAvailabilityPollEnabled ?? true,
       inboxPollEnabled: config?.inboxPollEnabled ?? true,
       stewardTriggerPollEnabled: config?.stewardTriggerPollEnabled ?? true,
