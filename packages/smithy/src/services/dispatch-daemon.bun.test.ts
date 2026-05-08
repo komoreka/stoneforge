@@ -6436,3 +6436,329 @@ describe('assignTaskToWorker - per-director targetBranch propagation', () => {
     });
   });
 });
+
+// ============================================================================
+// getDispatchHealth harness + tests
+// ============================================================================
+
+interface DaemonHarness {
+  api: QuarryAPI;
+  registry: AgentRegistry;
+  daemon: DispatchDaemon;
+  systemEntity: EntityId;
+  dispose(): Promise<void>;
+}
+
+async function setupDaemonHarness(opts?: { configOverrides?: Partial<DispatchDaemonConfig> }): Promise<DaemonHarness> {
+  const dbPath = `/tmp/dispatch-health-test-${Date.now()}-${Math.random().toString(36).slice(2)}.db`;
+  const storage = createStorage({ path: dbPath, create: true });
+  initializeSchema(storage);
+
+  const api = createQuarryAPI(storage);
+  const inboxService = createInboxService(storage);
+  const registry = createAgentRegistry(api);
+  const taskAssignment = createTaskAssignmentService(api);
+  const dispatchService = createDispatchService(api, taskAssignment, registry);
+  const sessionManager = createMockSessionManager();
+  const worktreeManager = createMockWorktreeManager();
+  const stewardScheduler = createMockStewardScheduler();
+
+  const { createEntity, EntityTypeValue } = await import('@stoneforge/core');
+  const systemRaw = await createEntity({
+    name: 'health-test-system',
+    entityType: EntityTypeValue.SYSTEM,
+    createdBy: 'system:test' as EntityId,
+  });
+  const saved = await api.create(systemRaw as unknown as Record<string, unknown> & { createdBy: EntityId });
+  const systemEntity = saved.id as unknown as EntityId;
+
+  const config: DispatchDaemonConfig = {
+    ensureTargetBranchExists: mockEnsureTargetBranchExists,
+    pollIntervalMs: 100,
+    workerAvailabilityPollEnabled: false,
+    inboxPollEnabled: false,
+    stewardTriggerPollEnabled: false,
+    workflowTaskPollEnabled: false,
+    ...opts?.configOverrides,
+  };
+
+  const daemon = createDispatchDaemon(
+    api,
+    registry,
+    sessionManager,
+    dispatchService,
+    worktreeManager,
+    taskAssignment,
+    stewardScheduler,
+    inboxService,
+    config
+  );
+
+  return {
+    api,
+    registry,
+    daemon,
+    systemEntity,
+    async dispose() {
+      await daemon.stop();
+      if (fs.existsSync(dbPath)) {
+        fs.unlinkSync(dbPath);
+      }
+    },
+  };
+}
+
+describe('getDispatchHealth', () => {
+  test('reports stuck=false when there are no ready tasks', async () => {
+    const harness = await setupDaemonHarness();
+    try {
+      const health = await harness.daemon.getDispatchHealth();
+      expect(health.readyUnassignedTasks).toBe(0);
+      expect(health.availableWorkers).toBe(0);
+      expect(health.stuck).toBe(false);
+      expect(typeof health.computedAt).toBe('string');
+    } finally {
+      await harness.dispose();
+    }
+  });
+
+  test('reports stuck=true when ready unassigned tasks exist and no workers are registered', async () => {
+    const harness = await setupDaemonHarness();
+    try {
+      const task = await createTask({
+        title: 'do the thing',
+        createdBy: harness.systemEntity,
+        status: TaskStatus.OPEN,
+      });
+      await harness.api.create(task as unknown as Record<string, unknown> & { createdBy: EntityId });
+      const health = await harness.daemon.getDispatchHealth();
+      expect(health.readyUnassignedTasks).toBe(1);
+      expect(health.availableWorkers).toBe(0);
+      expect(health.stuck).toBe(true);
+    } finally {
+      await harness.dispose();
+    }
+  });
+
+  test('reports stuck=false when ready unassigned tasks have at least one available worker', async () => {
+    const harness = await setupDaemonHarness();
+    try {
+      const task = await createTask({
+        title: 'do the thing',
+        createdBy: harness.systemEntity,
+        status: TaskStatus.OPEN,
+      });
+      await harness.api.create(task as unknown as Record<string, unknown> & { createdBy: EntityId });
+      await harness.registry.registerWorker({
+        name: 'w1',
+        workerMode: 'ephemeral',
+        createdBy: harness.systemEntity,
+      });
+      const health = await harness.daemon.getDispatchHealth();
+      expect(health.readyUnassignedTasks).toBe(1);
+      expect(health.availableWorkers).toBe(1);
+      expect(health.stuck).toBe(false);
+    } finally {
+      await harness.dispose();
+    }
+  });
+
+  test('treats disabled workers as unavailable for stuck-queue detection', async () => {
+    const harness = await setupDaemonHarness();
+    try {
+      const task = await createTask({
+        title: 'do the thing',
+        createdBy: harness.systemEntity,
+        status: TaskStatus.OPEN,
+      });
+      await harness.api.create(task as unknown as Record<string, unknown> & { createdBy: EntityId });
+      const w = await harness.registry.registerWorker({
+        name: 'w1',
+        workerMode: 'ephemeral',
+        createdBy: harness.systemEntity,
+      });
+      await harness.registry.updateAgentMetadata(w.id, { disabled: true });
+      const health = await harness.daemon.getDispatchHealth();
+      expect(health.availableWorkers).toBe(0);
+      expect(health.stuck).toBe(true);
+    } finally {
+      await harness.dispose();
+    }
+  });
+});
+
+describe('stuck-queue transition logging', () => {
+  test('emits a STUCK warn on the healthy → stuck transition, then stays silent on subsequent ticks', async () => {
+    const warnSpy = mock((..._args: unknown[]) => {});
+    const infoSpy = mock((..._args: unknown[]) => {});
+    const harness = await setupDaemonHarness({
+      configOverrides: { logger: { warn: warnSpy, info: infoSpy } },
+    });
+    try {
+      const task = await createTask({
+        title: 'x',
+        createdBy: harness.systemEntity,
+        status: TaskStatus.OPEN,
+      });
+      await harness.api.create(task as unknown as Record<string, unknown> & { createdBy: EntityId });
+      // No workers registered; queue is stuck.
+      await harness.daemon.tick();
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      const message = warnSpy.mock.calls[0][0] as string;
+      expect(message).toContain('STUCK');
+      expect(message).toContain('1 task(s) ready');
+      expect(message).toContain('no available workers');
+
+      // Subsequent stuck ticks must NOT spam the log (transition-only model).
+      await harness.daemon.tick();
+      await harness.daemon.tick();
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      await harness.dispose();
+    }
+  });
+
+  test('emits a RESUMED info on the stuck → healthy transition', async () => {
+    const warnSpy = mock((..._args: unknown[]) => {});
+    const infoSpy = mock((..._args: unknown[]) => {});
+    const harness = await setupDaemonHarness({
+      configOverrides: { logger: { warn: warnSpy, info: infoSpy } },
+    });
+    try {
+      const task = await createTask({
+        title: 'x',
+        createdBy: harness.systemEntity,
+        status: TaskStatus.OPEN,
+      });
+      await harness.api.create(task as unknown as Record<string, unknown> & { createdBy: EntityId });
+      // First tick: queue is stuck (no workers). Triggers STUCK warn.
+      await harness.daemon.tick();
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+
+      // Register a worker; on next tick the queue is healthy. Triggers RESUMED info.
+      await harness.registry.registerWorker({ name: 'w1', workerMode: 'ephemeral', createdBy: harness.systemEntity, maxConcurrentTasks: 1 });
+      await harness.daemon.tick();
+      expect(infoSpy).toHaveBeenCalledTimes(1);
+      const infoMessage = infoSpy.mock.calls[0][0] as string;
+      expect(infoMessage).toContain('RESUMED');
+    } finally {
+      await harness.dispose();
+    }
+  });
+});
+
+// ============================================================================
+// getDispatchHealth — pollStale detection
+// ============================================================================
+
+describe('getDispatchHealth - pollStale detection', () => {
+  test('reports lastPollCompletedAt fresh and pollStale=false right after a successful poll cycle', async () => {
+    const harness = await setupDaemonHarness();
+    try {
+      await harness.daemon.tick();
+      const health = await harness.daemon.getDispatchHealth();
+      expect(health.lastPollCompletedAt).toBeDefined();
+      expect(health.lastPollStartedAt).toBeDefined();
+      expect(health.pollStale).toBe(false);
+      // lastPollCompletedAt should be within the last second
+      const ageMs = Date.now() - new Date(health.lastPollCompletedAt!).getTime();
+      expect(ageMs).toBeLessThan(1000);
+    } finally {
+      await harness.dispose();
+    }
+  });
+
+  test('reports pollStale=false and undefined timestamps when daemon has never polled', async () => {
+    const harness = await setupDaemonHarness();
+    try {
+      // Don't call tick() — daemon is constructed but never polled.
+      const health = await harness.daemon.getDispatchHealth();
+      expect(health.lastPollStartedAt).toBeUndefined();
+      expect(health.lastPollCompletedAt).toBeUndefined();
+      // pollStale must be false when there's no baseline — we don't know if
+      // the daemon has had a chance to poll yet, so we must not false-alarm.
+      expect(health.pollStale).toBe(false);
+    } finally {
+      await harness.dispose();
+    }
+  });
+
+  test('reports pollStale=true when a poll cycle is wedged past the threshold', async () => {
+    // Simulate a wedged cycle: stub api.ready (called by both pollWorkerAvailability
+    // and getDispatchHealth itself) to return a never-resolving promise on the
+    // first invocation only. Start tick() without awaiting, sleep past the
+    // (very short) threshold, then probe health via a second api.ready call
+    // that resolves normally.
+    const harness = await setupDaemonHarness({
+      configOverrides: {
+        // Override threshold to a tiny value so the test runs fast.
+        pollStaleThresholdMs: 50,
+        // Enable the worker-availability poll so api.ready actually gets called.
+        workerAvailabilityPollEnabled: true,
+      },
+    });
+    try {
+      // Wedge the first runPollCycle by making api.ready hang on the first call.
+      // Subsequent calls (e.g. from getDispatchHealth) must resolve quickly.
+      const realReady = harness.api.ready.bind(harness.api);
+      let callCount = 0;
+      const neverResolves = new Promise<never>(() => { /* never */ });
+      const stubbedApi = harness.api as { ready: typeof harness.api.ready };
+      stubbedApi.ready = ((filter?: Parameters<typeof realReady>[0]) => {
+        callCount += 1;
+        if (callCount === 1) return neverResolves;
+        return realReady(filter);
+      }) as typeof harness.api.ready;
+
+      // Start tick() but don't await — the cycle wedges inside.
+      const wedgedTick = harness.daemon.tick();
+      void wedgedTick; // prevent unused-var lint
+
+      // Wait past the threshold (50ms) plus a margin. lastPollStartedAt was set
+      // at the top of runPollCycle, lastPollCompletedAt was NOT set because
+      // the finally block hasn't been reached yet.
+      await new Promise(r => setTimeout(r, 150));
+
+      const health = await harness.daemon.getDispatchHealth();
+      expect(health.pollStale).toBe(true);
+      expect(health.lastPollStartedAt).toBeDefined();
+      expect(health.lastPollCompletedAt).toBeUndefined();
+    } finally {
+      await harness.dispose();
+    }
+  });
+
+  test('honors a custom pollStaleThresholdMs from config', async () => {
+    // Default threshold is max(60_000, 10 × pollIntervalMs). With a custom
+    // override, a freshly-completed poll reports pollStale=false, but if we
+    // artificially push lastPollCompletedAt back past the override, pollStale
+    // flips true.
+    const harness = await setupDaemonHarness({
+      configOverrides: { pollStaleThresholdMs: 10 },
+    });
+    try {
+      await harness.daemon.tick();
+      // Right after tick: not stale.
+      let health = await harness.daemon.getDispatchHealth();
+      expect(health.pollStale).toBe(false);
+
+      // Force BOTH timestamps back 100ms (well past the 10ms threshold). In a
+      // real wedge both move together; pushing only one would simulate
+      // "cycle in flight" and trigger the in-flight branch instead of the
+      // completed-but-stale branch we want to exercise here.
+      // Cast through unknown to access private fields — acceptable for tests.
+      const daemon = harness.daemon as unknown as {
+        lastPollStartedAt: string;
+        lastPollCompletedAt: string;
+      };
+      const past = new Date(Date.now() - 100).toISOString();
+      daemon.lastPollStartedAt = past;
+      daemon.lastPollCompletedAt = past;
+
+      health = await harness.daemon.getDispatchHealth();
+      expect(health.pollStale).toBe(true);
+    } finally {
+      await harness.dispose();
+    }
+  });
+});

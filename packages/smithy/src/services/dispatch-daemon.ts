@@ -28,6 +28,7 @@ import type {
   Document,
   Plan,
   Workflow,
+  Timestamp,
 } from '@stoneforge/core';
 import { InboxStatus, createTimestamp, TaskStatus, asEntityId, asElementId, PlanStatus, canAutoComplete, WorkflowStatus, computeWorkflowStatus, updateWorkflowStatus } from '@stoneforge/core';
 import type { QuarryAPI, InboxService } from '@stoneforge/quarry';
@@ -162,6 +163,17 @@ export interface DispatchDaemonConfig {
   readonly pollIntervalMs?: number;
 
   /**
+   * Threshold in milliseconds beyond which `getDispatchHealth().pollStale`
+   * flips true if no poll cycle has completed. Detects a daemon whose
+   * `runPollCycle` is wedged mid-await (HTTP responsive but loop dead).
+   * Default: max(60000, 10 × pollIntervalMs).
+   * Set generously above any healthy poll cycle duration; orphan recovery
+   * + inbox triage + steward triggers can plausibly take 10+ seconds on a
+   * loaded workspace.
+   */
+  readonly pollStaleThresholdMs?: number;
+
+  /**
    * Whether worker availability polling is enabled.
    * Default: true
    */
@@ -294,6 +306,48 @@ export interface DispatchDaemonConfig {
    * Useful for testing without triggering real git remote operations.
    */
   readonly ensureTargetBranchExists?: (projectRoot: string, branchName: string) => Promise<void>;
+
+  /** Optional logger override. Defaults to the module-level dispatch-daemon logger. Used for testability. */
+  readonly logger?: { warn: (...args: unknown[]) => void; info?: (...args: unknown[]) => void };
+}
+
+/**
+ * Snapshot of the dispatch worker queue's stuck state.
+ * Computed on demand from the agent registry and ready-task list.
+ * A queue is "stuck" when there are unassigned ready tasks but no worker
+ * could take them (registered, not disabled, not terminated). At-capacity
+ * workers do NOT count: the queue is busy, not stuck.
+ */
+export interface DispatchHealth {
+  /** Count of ready tasks (api.ready result) that have no assignee. */
+  readonly readyUnassignedTasks: number;
+  /** Count of workers eligible to take new work: registered, not disabled, not terminated. */
+  readonly availableWorkers: number;
+  /** True iff readyUnassignedTasks > 0 && availableWorkers === 0. */
+  readonly stuck: boolean;
+  /** Convenience alias for stuck, matching the field name surfaced in the HTTP and UI layers. */
+  readonly hasStuckQueue: boolean;
+  /** Timestamp the snapshot was computed (ISO 8601). */
+  readonly computedAt: string;
+  /**
+   * Timestamp when the most recent poll cycle entered its try block (set BEFORE
+   * any await). Undefined if no cycle has ever started. Compared with
+   * `lastPollCompletedAt` and wall-clock to derive {@link pollStale}.
+   */
+  readonly lastPollStartedAt?: string;
+  /**
+   * Timestamp when the most recent poll cycle reached its `finally` block.
+   * Undefined if no cycle has completed yet. A wedged cycle leaves this old.
+   */
+  readonly lastPollCompletedAt?: string;
+  /**
+   * True when the daemon's HTTP server is alive but its poll loop has not
+   * completed a cycle within the configured staleness threshold. Indicates
+   * the daemon is wedged: process up, dispatch / scheduling / recovery down.
+   * Always false until a baseline `lastPollCompletedAt` exists, so a
+   * just-started daemon does not false-alarm.
+   */
+  readonly pollStale: boolean;
 }
 
 /**
@@ -319,6 +373,7 @@ export interface PollResult {
  */
 interface NormalizedConfig {
   pollIntervalMs: number;
+  pollStaleThresholdMs: number;
   workerAvailabilityPollEnabled: boolean;
   inboxPollEnabled: boolean;
   stewardTriggerPollEnabled: boolean;
@@ -338,6 +393,7 @@ interface NormalizedConfig {
   directorInboxForwardingEnabled: boolean;
   directorInboxIdleThresholdMs: number;
   ensureTargetBranchExists: (projectRoot: string, branchName: string) => Promise<void>;
+  logger?: { warn: (...args: unknown[]) => void; info?: (...args: unknown[]) => void };
 }
 
 // ============================================================================
@@ -478,13 +534,29 @@ export interface DispatchDaemon {
   /**
    * Gets the current configuration.
    */
-  getConfig(): Omit<Required<DispatchDaemonConfig>, 'onSessionStarted'> & { onSessionStarted?: OnSessionStartedCallback };
+  getConfig(): Omit<Required<DispatchDaemonConfig>, 'onSessionStarted' | 'logger'> & { onSessionStarted?: OnSessionStartedCallback; logger?: { warn: (...args: unknown[]) => void } };
 
   /**
    * Updates the configuration.
    * Takes effect on the next poll cycle.
    */
   updateConfig(config: Partial<DispatchDaemonConfig>): void;
+
+  // ----------------------------------------
+  // Health
+  // ----------------------------------------
+
+  /**
+   * Returns a snapshot of dispatch worker-queue health.
+   * Inexpensive (one ready-task query, one agent list query); safe to call from HTTP routes.
+   */
+  getDispatchHealth(): Promise<DispatchHealth>;
+
+  /**
+   * Manually triggers one complete poll cycle (same work as the interval-driven cycle).
+   * Useful for testing and for callers that want to force an immediate dispatch pass.
+   */
+  tick(): Promise<void>;
 
   // ----------------------------------------
   // Events
@@ -536,6 +608,25 @@ export class DispatchDaemonImpl implements DispatchDaemon {
   private currentPollCycle?: Promise<void>;
   private rateLimitSleepTimer?: NodeJS.Timeout;
   private lastWakeAt?: number;
+  /**
+   * ISO timestamp when the most recent `runPollCycle` invocation entered the
+   * try block. Set BEFORE awaiting any work, so a wedged-mid-cycle daemon
+   * leaves this value old. Compared against `lastPollCompletedAt` and
+   * wall-clock to detect staleness in {@link getDispatchHealth}.
+   */
+  private lastPollStartedAt?: Timestamp;
+  /**
+   * ISO timestamp when the most recent `runPollCycle` invocation finished
+   * (whether it succeeded or threw). Set in the `finally` block. A wedged
+   * cycle never reaches this assignment, so the value stays frozen at the
+   * previous successful completion (or undefined if no cycle has yet
+   * completed). Note that during a wedge, `lastPollStartedAt` also stops
+   * advancing because the re-entrancy guard at the top of `runPollCycle`
+   * bails on every subsequent setInterval tick — only the wedged cycle's
+   * own start-time is recorded. Surfaced via {@link getDispatchHealth}
+   * as the canonical "loop is alive" signal.
+   */
+  private lastPollCompletedAt?: Timestamp;
 
   /**
    * Tracks inbox item IDs that are currently being forwarded to persistent agents.
@@ -575,6 +666,16 @@ export class DispatchDaemonImpl implements DispatchDaemon {
 
   /** TTL for emitted warning deduplication keys (5 minutes). */
   private static readonly WARNING_DEDUP_TTL_MS = 5 * 60 * 1000;
+
+  /**
+   * Ticks elapsed since the last stuck-queue warn was emitted.
+   * Initialized to POSITIVE_INFINITY so the first stuck tick warns immediately
+   * (Infinity + 1 is still Infinity, which is >= any interval).
+   * Reset to POSITIVE_INFINITY when the queue is healthy so re-stuckening
+   * warns immediately again.
+   */
+  /** Tracks the last reported stuck state so we log only on transitions, never on every tick. */
+  private lastReportedStuck = false;
 
   constructor(
     api: QuarryAPI,
@@ -712,6 +813,99 @@ export class DispatchDaemonImpl implements DispatchDaemon {
 
   isRunning(): boolean {
     return this.running;
+  }
+
+  // ----------------------------------------
+  // Health
+  // ----------------------------------------
+
+  async getDispatchHealth(): Promise<DispatchHealth> {
+    const readyTasks = await this.api.ready({ includeEphemeral: true });
+    const readyUnassignedTasks = readyTasks.filter(t => !t.assignee).length;
+
+    const allAgents = await this.agentRegistry.listAgents();
+    const availableWorkers = allAgents.filter(a => {
+      const meta = getAgentMetadata(a);
+      if (!meta || meta.agentRole !== 'worker') return false;
+      if (isAgentDisabled(a)) return false;
+      if (meta.sessionStatus === 'terminated') return false;
+      return true;
+    }).length;
+
+    const stuck = readyUnassignedTasks > 0 && availableWorkers === 0;
+
+    // pollStale catches two failure modes:
+    // 1) A cycle is currently in flight (startedAt exists and is newer than
+    //    completedAt, or completedAt doesn't exist at all) and has been
+    //    running for longer than the threshold. This is the wedged-mid-await
+    //    case observed in production.
+    // 2) No cycle is in flight, but the last completed cycle is older than
+    //    the threshold (i.e. setInterval stopped firing entirely — rarer,
+    //    since a frozen event loop would also stop responding to HTTP).
+    // If neither timestamp is set, pollStale stays false to avoid false-firing
+    // on a just-started daemon that hasn't had a chance to poll yet.
+    let pollStale = false;
+    const now = Date.now();
+    const threshold = this.config.pollStaleThresholdMs;
+    const startedAtMs = this.lastPollStartedAt
+      ? new Date(this.lastPollStartedAt).getTime()
+      : undefined;
+    const completedAtMs = this.lastPollCompletedAt
+      ? new Date(this.lastPollCompletedAt).getTime()
+      : undefined;
+    const cycleInFlight = startedAtMs !== undefined
+      && (completedAtMs === undefined || startedAtMs > completedAtMs);
+    if (cycleInFlight && startedAtMs !== undefined) {
+      pollStale = now - startedAtMs > threshold;
+    } else if (completedAtMs !== undefined) {
+      pollStale = now - completedAtMs > threshold;
+    }
+
+    return {
+      readyUnassignedTasks,
+      availableWorkers,
+      stuck,
+      hasStuckQueue: stuck,
+      computedAt: new Date().toISOString(),
+      lastPollStartedAt: this.lastPollStartedAt,
+      lastPollCompletedAt: this.lastPollCompletedAt,
+      pollStale,
+    };
+  }
+
+  async tick(): Promise<void> {
+    await this.runPollCycle();
+  }
+
+  /**
+   * Logs ONLY on stuck-queue state transitions, never repeats while the state holds.
+   * Healthy → Stuck: emits a single STUCK warn line.
+   * Stuck → Healthy: emits a single RESUMED info line.
+   * No periodic reminders, so a long-running stuck state does not spam logs.
+   */
+  private async maybeLogStuckQueueWarning(): Promise<void> {
+    let health: DispatchHealth;
+    try {
+      health = await this.getDispatchHealth();
+    } catch {
+      // Health computation must never crash the tick loop.
+      return;
+    }
+
+    if (health.stuck && !this.lastReportedStuck) {
+      const log = this.config.logger ?? logger;
+      log.warn(
+        `[dispatch] STUCK: ${health.readyUnassignedTasks} task(s) ready, no available workers. Register or enable a worker so dispatch can proceed.`
+      );
+      this.lastReportedStuck = true;
+    } else if (!health.stuck && this.lastReportedStuck) {
+      const log = this.config.logger ?? logger;
+      const info = log.info ?? log.warn;
+      info(
+        `[dispatch] RESUMED: ${health.availableWorkers} worker(s) available, dispatch flowing again.`
+      );
+      this.lastReportedStuck = false;
+    }
   }
 
   // ----------------------------------------
@@ -1916,7 +2110,7 @@ export class DispatchDaemonImpl implements DispatchDaemon {
   // Configuration
   // ----------------------------------------
 
-  getConfig(): Omit<Required<DispatchDaemonConfig>, 'onSessionStarted'> & { onSessionStarted?: OnSessionStartedCallback } {
+  getConfig(): Omit<Required<DispatchDaemonConfig>, 'onSessionStarted' | 'logger'> & { onSessionStarted?: OnSessionStartedCallback; logger?: { warn: (...args: unknown[]) => void } } {
     return { ...this.config };
   }
 
@@ -2006,8 +2200,15 @@ export class DispatchDaemonImpl implements DispatchDaemon {
     let pollIntervalMs = config?.pollIntervalMs ?? DISPATCH_DAEMON_DEFAULT_POLL_INTERVAL_MS;
     pollIntervalMs = Math.max(DISPATCH_DAEMON_MIN_POLL_INTERVAL_MS, Math.min(DISPATCH_DAEMON_MAX_POLL_INTERVAL_MS, pollIntervalMs));
 
+    // Default staleness threshold: max(60s, 10× poll interval). 60s is well
+    // above any healthy cycle's expected duration; 10× protects users running
+    // with a custom long pollIntervalMs.
+    const pollStaleThresholdMs = config?.pollStaleThresholdMs
+      ?? Math.max(60_000, 10 * pollIntervalMs);
+
     return {
       pollIntervalMs,
+      pollStaleThresholdMs,
       workerAvailabilityPollEnabled: config?.workerAvailabilityPollEnabled ?? true,
       inboxPollEnabled: config?.inboxPollEnabled ?? true,
       stewardTriggerPollEnabled: config?.stewardTriggerPollEnabled ?? true,
@@ -2027,6 +2228,7 @@ export class DispatchDaemonImpl implements DispatchDaemon {
       directorInboxForwardingEnabled: config?.directorInboxForwardingEnabled ?? true,
       directorInboxIdleThresholdMs: config?.directorInboxIdleThresholdMs ?? 120_000,
       ensureTargetBranchExists: config?.ensureTargetBranchExists ?? ensureTargetBranchExists,
+      logger: config?.logger,
     };
   }
 
@@ -2036,6 +2238,7 @@ export class DispatchDaemonImpl implements DispatchDaemon {
   private async runPollCycle(): Promise<void> {
     if (this.polling) return;
     this.polling = true;
+    this.lastPollStartedAt = createTimestamp();
     try {
       // Check if dispatch is paused due to rate limiting.
       // When paused, skip dispatch-related polls but still run non-dispatch work.
@@ -2133,7 +2336,10 @@ export class DispatchDaemonImpl implements DispatchDaemon {
       if (this.config.workflowAutoTransitionEnabled) {
         await this.pollWorkflowAutoTransition();
       }
+
+      await this.maybeLogStuckQueueWarning();
     } finally {
+      this.lastPollCompletedAt = createTimestamp();
       this.polling = false;
     }
   }
