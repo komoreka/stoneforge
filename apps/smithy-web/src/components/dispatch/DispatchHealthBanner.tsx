@@ -36,11 +36,13 @@ export function DispatchHealthBanner({ className }: DispatchHealthBannerProps = 
   const headline = pollStale ? 'Dispatch daemon is wedged.' : 'Dispatch is stuck.';
 
   // Compute approximate stuck duration for the message body. Falls back to
-  // "for a while" when timestamps are missing — copy stays readable.
+  // "for a while" when timestamps are missing or the wedge is under a minute.
+  // Math.floor matches the "for over N minutes" wording: a 90-second wedge
+  // reads "for over 1 minute", not "for over 2 minutes".
   const lastCompletedAt = health?.lastPollCompletedAt;
   let stuckForCopy = 'for a while';
   if (lastCompletedAt) {
-    const ageMin = Math.round((Date.now() - new Date(lastCompletedAt).getTime()) / 60000);
+    const ageMin = Math.floor((Date.now() - new Date(lastCompletedAt).getTime()) / 60000);
     if (ageMin >= 1) stuckForCopy = `for over ${ageMin} minute${ageMin === 1 ? '' : 's'}`;
   }
 
