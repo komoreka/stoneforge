@@ -1210,10 +1210,16 @@ export class DispatchDaemonImpl implements DispatchDaemon {
     this.emitter.emit('poll:start', 'orphan-recovery');
 
     try {
-      // 1. Get all ephemeral workers
+      // 1. Get all workers (both ephemeral and persistent).
+      // Persistent workers are excluded from pollWorkerAvailability (they
+      // should not auto-claim from the unassigned queue), but they still need
+      // orphan recovery: when a director assigns them a task and they have no
+      // active session, the daemon must spawn one. Without this, persistent
+      // workers sit idle indefinitely waiting for an inbox message that never
+      // arrives, since processPersistentAgentMessage only forwards to existing
+      // sessions.
       const workers = await this.agentRegistry.listAgents({
         role: 'worker',
-        workerMode: 'ephemeral',
       });
 
       // Track recovery stewards assigned during this cycle to prevent cascade assignment.
