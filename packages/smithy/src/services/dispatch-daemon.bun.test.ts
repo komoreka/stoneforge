@@ -693,6 +693,40 @@ describe('recoverOrphanedAssignments', () => {
 
     expect(result.processed).toBe(0);
   });
+
+  test('recovers persistent worker with assigned task and no prior session', async () => {
+    // Persistent workers are excluded from pollWorkerAvailability (they don't
+    // auto-claim from the unassigned queue), so without orphan recovery picking
+    // them up, a director-assigned task would sit forever waiting for a session.
+    const worker = await agentRegistry.registerWorker({
+      name: 'persistent-grace',
+      workerMode: 'persistent',
+      createdBy: systemEntity,
+      maxConcurrentTasks: 1,
+    });
+    const workerId = worker.id as unknown as EntityId;
+
+    // No previousSessionId — fresh assignment by the director.
+    await createAssignedTask('Newly assigned task', workerId, {
+      worktree: '/worktrees/persistent-grace/task',
+      branch: 'agent/persistent-grace/task-branch',
+    });
+
+    const result = await daemon.recoverOrphanedAssignments();
+
+    expect(result.pollType).toBe('orphan-recovery');
+    expect(result.processed).toBe(1);
+    expect(result.errors).toBe(0);
+
+    // Falls through to fresh spawn since no providerSessionId in metadata.
+    expect(sessionManager.startSession).toHaveBeenCalledWith(
+      workerId,
+      expect.objectContaining({
+        worktree: '/worktrees/persistent-grace/task',
+      })
+    );
+    expect(sessionManager.resumeSession).not.toHaveBeenCalled();
+  });
 });
 
 describe('pollWorkflowTasks - merge steward dispatch', () => {
