@@ -1248,7 +1248,12 @@ export class DispatchDaemonImpl implements DispatchDaemon {
         }
 
         // 4. Check if the task is stuck in a resume loop
-        const taskAssignment = workerTasks[0];
+        // Sort by priority ascending (lower number = higher priority) so the
+        // highest-priority assigned task is always recovered first.
+        const sortedWorkerTasks = [...workerTasks].sort(
+          (a, b) => (a.task.priority ?? 99) - (b.task.priority ?? 99)
+        );
+        const taskAssignment = sortedWorkerTasks[0];
         let resumeCount = taskAssignment.orchestratorMeta?.resumeCount ?? 0;
         const maxResumes = this.config.maxResumeAttemptsBeforeRecovery;
 
