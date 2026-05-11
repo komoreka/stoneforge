@@ -6361,6 +6361,114 @@ describe('recoverOrphanedAssignments - persistent worker support', () => {
 });
 
 // ============================================================================
+// recoverOrphanedAssignments — Director orphan recovery (Phase 0)
+// ============================================================================
+
+describe('recoverOrphanedAssignments - director orphan recovery', () => {
+  let api: QuarryAPI;
+  let inboxService: InboxService;
+  let agentRegistry: AgentRegistry;
+  let taskAssignment: TaskAssignmentService;
+  let dispatchService: DispatchService;
+  let sessionManager: ReturnType<typeof createMockSessionManager>;
+  let worktreeManager: WorktreeManager;
+  let stewardScheduler: StewardScheduler;
+  let daemon: DispatchDaemon;
+  let testDbPath: string;
+  let systemEntity: EntityId;
+
+  beforeEach(async () => {
+    testDbPath = `/tmp/dispatch-daemon-director-recovery-test-${Date.now()}-${Math.random().toString(36).slice(2)}.db`;
+    const storage = createStorage({ path: testDbPath, create: true });
+    initializeSchema(storage);
+
+    api = createQuarryAPI(storage);
+    inboxService = createInboxService(storage);
+    agentRegistry = createAgentRegistry(api);
+    taskAssignment = createTaskAssignmentService(api);
+    dispatchService = createDispatchService(api, taskAssignment, agentRegistry);
+    sessionManager = createMockSessionManager();
+    worktreeManager = createMockWorktreeManager();
+    stewardScheduler = createMockStewardScheduler();
+
+    const { createEntity, EntityTypeValue } = await import('@stoneforge/core');
+    const entity = await createEntity({
+      name: 'test-system',
+      entityType: EntityTypeValue.SYSTEM,
+      createdBy: 'system:test' as EntityId,
+    });
+    const saved = await api.create(entity as unknown as Record<string, unknown> & { createdBy: EntityId });
+    systemEntity = saved.id as unknown as EntityId;
+
+    daemon = createDispatchDaemon(
+      api,
+      agentRegistry,
+      sessionManager as unknown as SessionManager,
+      dispatchService,
+      worktreeManager,
+      taskAssignment,
+      stewardScheduler,
+      inboxService,
+      { pollIntervalMs: 5000 }
+    );
+  });
+
+  afterEach(async () => {
+    await daemon.stop();
+    if (fs.existsSync(testDbPath)) fs.unlinkSync(testDbPath);
+  });
+
+  test('respawns director when session has terminated', async () => {
+    const director = await agentRegistry.registerDirector({
+      name: 'TestDirector',
+      createdBy: systemEntity,
+    });
+    const directorId = director.id as unknown as EntityId;
+
+    const result = await daemon.recoverOrphanedAssignments();
+
+    expect(result.processed).toBeGreaterThanOrEqual(1);
+    expect(sessionManager.startSession).toHaveBeenCalledWith(
+      directorId,
+      expect.objectContaining({ workingDirectory: expect.any(String) })
+    );
+  });
+
+  test('does not respawn director when session is active', async () => {
+    const director = await agentRegistry.registerDirector({
+      name: 'ActiveDirector',
+      createdBy: systemEntity,
+    });
+    const directorId = director.id as unknown as EntityId;
+
+    await sessionManager.startSession(directorId, { workingDirectory: '/tmp' });
+    const callsBefore = (sessionManager.startSession as ReturnType<typeof mock>).mock.calls.length;
+
+    await daemon.recoverOrphanedAssignments();
+
+    const callsAfter = (sessionManager.startSession as ReturnType<typeof mock>).mock.calls.length;
+    expect(callsAfter).toBe(callsBefore);
+  });
+
+  test('initial prompt contains director role framing and director ID', async () => {
+    const director = await agentRegistry.registerDirector({
+      name: 'PromptCheckDirector',
+      createdBy: systemEntity,
+    });
+    const directorId = director.id as unknown as EntityId;
+
+    await daemon.recoverOrphanedAssignments();
+
+    const calls = (sessionManager.startSession as ReturnType<typeof mock>).mock.calls;
+    const call = calls.find((c: unknown[]) => c[0] === directorId);
+    const options = call?.[1] as StartSessionOptions | undefined;
+
+    expect(options?.initialPrompt).toContain('Director ID');
+    expect(options?.initialPrompt).toContain(directorId);
+  });
+});
+
+// ============================================================================
 // Per-Director Target Branch Propagation
 // ============================================================================
 

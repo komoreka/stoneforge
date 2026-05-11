@@ -1404,6 +1404,38 @@ export class DispatchDaemonImpl implements DispatchDaemon {
     this.emitter.emit('poll:start', 'orphan-recovery');
 
     try {
+      // Phase 0: Recover orphaned director sessions.
+      // Directors have no auto-recovery path: pollWorkerAvailability skips them
+      // (not workers), and Phase 1 below is worker-only. When a director's
+      // session terminates (context-window exhaustion, process crash, or service
+      // restart without clean shutdown), sessionStatus stays 'running' or flips
+      // to 'idle'. Either way, no persistent worker receives new task assignments
+      // — the whole system stalls until the director is manually restarted.
+      // Detect and respawn here so the system is self-healing.
+      const directors = await this.agentRegistry.listAgents({ role: 'director' });
+      for (const director of directors) {
+        if (isAgentDisabled(director)) continue;
+        const directorId = asEntityId(director.id);
+        // getActiveSession performs PID liveness check and calls cleanupDeadSession
+        // if the process is gone, which resets sessionStatus to 'idle'.
+        const activeSession = this.sessionManager.getActiveSession(directorId);
+        if (activeSession) continue;
+        try {
+          const spawned = await this.spawnDirectorSession(director);
+          if (spawned) {
+            processed++;
+            logger.info(`[orphan-recovery] Respawned director ${director.name} — session had terminated`);
+            this.operationLog?.write('info', 'recovery', `Respawned director ${director.name}`, { agentId: directorId });
+          }
+        } catch (error) {
+          errors++;
+          const errorMessage = error instanceof Error ? error.message : String(error);
+          errorMessages.push(`Director ${director.name}: ${errorMessage}`);
+          logger.error(`[orphan-recovery] Error respawning director ${director.name}:`, error);
+          this.operationLog?.write('error', 'recovery', `Failed to respawn director ${director.name}: ${errorMessage}`, { agentId: directorId });
+        }
+      }
+
       // 1. Get all workers (both ephemeral and persistent).
       // Persistent workers are excluded from pollWorkerAvailability (they
       // should not auto-claim from the unassigned queue), but they still need
@@ -3287,6 +3319,42 @@ export class DispatchDaemonImpl implements DispatchDaemon {
     );
 
     return parts.join('\n');
+  }
+
+  /**
+  /**
+   * Spawns a new session for a director whose session has terminated.
+   * Mirrors the prompt-framing logic in the sessions route so the director
+   * receives the same role prompt and identity injection it would from `sf agent start`.
+   */
+  private async spawnDirectorSession(director: AgentEntity): Promise<boolean> {
+    const directorId = asEntityId(director.id);
+
+    // Double-check: a concurrent poll cycle may have already spawned this director.
+    const existing = this.sessionManager.getActiveSession(directorId);
+    if (existing) return false;
+
+    const roleResult = loadRolePrompt('director', undefined, { projectRoot: this.config.projectRoot });
+    let initialPrompt: string;
+
+    if (roleResult?.prompt) {
+      const framedRole =
+        `Please read and internalize the following operating instructions. ` +
+        `These define your role and how you should behave in this session:\n\n${roleResult.prompt}`;
+      const idSection = `\n\n**Director ID:** ${directorId}`;
+      const presetSection = this.buildWorkflowPresetContextSection();
+      const presetBlock = presetSection ? `\n\n${presetSection}` : '';
+      initialPrompt = `${framedRole}${idSection}${presetBlock}`;
+    } else {
+      initialPrompt = `**Director ID:** ${directorId}`;
+    }
+
+    await this.sessionManager.startSession(directorId, {
+      workingDirectory: this.config.projectRoot,
+      initialPrompt,
+    });
+
+    return true;
   }
 
   /**
