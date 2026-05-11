@@ -693,6 +693,64 @@ describe('recoverOrphanedAssignments', () => {
 
     expect(result.processed).toBe(0);
   });
+
+  test('recovers highest-priority task first when multiple are assigned', async () => {
+    const { createTask: createTaskFn } = await import('@stoneforge/core');
+
+    const worker = await createTestWorker('priority-grace');
+    const workerId = worker.id as unknown as EntityId;
+
+    // Create P3 (low) task FIRST — naive creation-order selection would pick this
+    const lowPriorityTaskData = await createTaskFn({
+      title: 'Low priority task',
+      createdBy: systemEntity,
+      status: TaskStatus.OPEN,
+      priority: Priority.LOW,
+      assignee: workerId,
+    });
+    const savedLow = await api.create(lowPriorityTaskData as unknown as Record<string, unknown> & { createdBy: EntityId }) as Task;
+    await api.update(savedLow.id, {
+      metadata: updateOrchestratorTaskMeta(undefined, {
+        assignedAgent: workerId,
+        branch: 'agent/priority-grace/low-task-branch',
+        worktree: '/worktrees/priority-grace/low-task',
+      }),
+    });
+
+    // Create P1 (critical) task SECOND
+    const highPriorityTaskData = await createTaskFn({
+      title: 'High priority task',
+      createdBy: systemEntity,
+      status: TaskStatus.OPEN,
+      priority: Priority.CRITICAL,
+      assignee: workerId,
+    });
+    const savedHigh = await api.create(highPriorityTaskData as unknown as Record<string, unknown> & { createdBy: EntityId }) as Task;
+    await api.update(savedHigh.id, {
+      metadata: updateOrchestratorTaskMeta(undefined, {
+        assignedAgent: workerId,
+        branch: 'agent/priority-grace/high-task-branch',
+        worktree: '/worktrees/priority-grace/high-task',
+      }),
+    });
+
+    const result = await daemon.recoverOrphanedAssignments();
+
+    expect(result.processed).toBe(1);
+    // Must have spawned a session in the HIGH priority task's worktree, not the low one
+    expect(sessionManager.startSession).toHaveBeenCalledWith(
+      workerId,
+      expect.objectContaining({
+        workingDirectory: '/worktrees/priority-grace/high-task',
+      })
+    );
+    expect(sessionManager.startSession).not.toHaveBeenCalledWith(
+      workerId,
+      expect.objectContaining({
+        workingDirectory: '/worktrees/priority-grace/low-task',
+      })
+    );
+  });
 });
 
 describe('pollWorkflowTasks - merge steward dispatch', () => {
