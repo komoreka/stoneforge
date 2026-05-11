@@ -1210,10 +1210,13 @@ export class DispatchDaemonImpl implements DispatchDaemon {
     this.emitter.emit('poll:start', 'orphan-recovery');
 
     try {
-      // 1. Get all ephemeral workers
+      // 1. Get all workers (ephemeral and persistent).
+      // Persistent workers are excluded from pollWorkerAvailability (they should
+      // not auto-claim from the unassigned queue), but they still need orphan
+      // recovery: when a director assigns them a task and they have no active
+      // session, nothing else in the daemon will spawn one.
       const workers = await this.agentRegistry.listAgents({
         role: 'worker',
-        workerMode: 'ephemeral',
       });
 
       // Track recovery stewards assigned during this cycle to prevent cascade assignment.
@@ -2994,9 +2997,15 @@ export class DispatchDaemonImpl implements DispatchDaemon {
   private async buildTaskPrompt(task: Task, workerId: EntityId): Promise<string> {
     const parts: string[] = [];
 
+    // Look up the worker's actual mode — persistent workers must receive their
+    // own prompt (not the ephemeral one that tells them to exit after each task).
+    const workerAgent = await this.agentRegistry.getAgent(workerId);
+    const workerMeta = workerAgent ? getAgentMetadata(workerAgent) : undefined;
+    const workerMode = (workerMeta as WorkerMetadata | undefined)?.workerMode ?? 'ephemeral';
+
     // Load and include the worker role prompt, framed as operating instructions
     // so Claude understands this is its role definition, not file content
-    const roleResult = loadRolePrompt('worker', undefined, { projectRoot: this.config.projectRoot, workerMode: 'ephemeral' });
+    const roleResult = loadRolePrompt('worker', undefined, { projectRoot: this.config.projectRoot, workerMode });
     if (roleResult) {
       parts.push(
         'Please read and internalize the following operating instructions. These define your role and how you should behave:',
