@@ -6265,6 +6265,102 @@ describe('assignTaskToWorker - missing agent channel resilience', () => {
 });
 
 // ============================================================================
+// Persistent Worker Orphan Recovery + Prompt Selection
+// ============================================================================
+
+describe('recoverOrphanedAssignments - persistent worker support', () => {
+  let api: QuarryAPI;
+  let inboxService: InboxService;
+  let agentRegistry: AgentRegistry;
+  let taskAssignment: TaskAssignmentService;
+  let dispatchService: DispatchService;
+  let sessionManager: SessionManager;
+  let worktreeManager: WorktreeManager;
+  let stewardScheduler: StewardScheduler;
+  let daemon: DispatchDaemon;
+  let testDbPath: string;
+  let systemEntity: EntityId;
+
+  beforeEach(async () => {
+    testDbPath = `/tmp/dispatch-daemon-persistent-test-${Date.now()}-${Math.random().toString(36).slice(2)}.db`;
+    const storage = createStorage({ path: testDbPath, create: true });
+    initializeSchema(storage);
+
+    api = createQuarryAPI(storage);
+    inboxService = createInboxService(storage);
+    agentRegistry = createAgentRegistry(api);
+    taskAssignment = createTaskAssignmentService(api);
+    dispatchService = createDispatchService(api, taskAssignment, agentRegistry);
+    sessionManager = createMockSessionManager();
+    worktreeManager = createMockWorktreeManager();
+    stewardScheduler = createMockStewardScheduler();
+
+    const { createEntity, EntityTypeValue } = await import('@stoneforge/core');
+    const entity = await createEntity({
+      name: 'test-system',
+      entityType: EntityTypeValue.SYSTEM,
+      createdBy: 'system:test' as EntityId,
+    });
+    const saved = await api.create(entity as unknown as Record<string, unknown> & { createdBy: EntityId });
+    systemEntity = saved.id as unknown as EntityId;
+
+    daemon = createDispatchDaemon(
+      api, agentRegistry, sessionManager, dispatchService,
+      worktreeManager, taskAssignment, stewardScheduler, inboxService,
+      { ensureTargetBranchExists: mockEnsureTargetBranchExists, pollIntervalMs: 100,
+        workerAvailabilityPollEnabled: false, inboxPollEnabled: false,
+        stewardTriggerPollEnabled: false, workflowTaskPollEnabled: false }
+    );
+  });
+
+  afterEach(async () => {
+    await daemon.stop();
+    if (fs.existsSync(testDbPath)) fs.unlinkSync(testDbPath);
+  });
+
+  test('recovers persistent worker with assigned task and no prior session', async () => {
+    const worker = await agentRegistry.registerWorker({
+      name: 'PersistentWorker',
+      workerMode: 'persistent',
+      createdBy: systemEntity,
+      maxConcurrentTasks: 1,
+    });
+
+    const task = await createTask({ title: 'Task for persistent worker', createdBy: systemEntity, status: TaskStatus.OPEN, assignee: worker.id as unknown as EntityId });
+    await api.create(task as unknown as Record<string, unknown> & { createdBy: EntityId });
+
+    const result = await daemon.recoverOrphanedAssignments();
+
+    expect(result.processed).toBe(1);
+    expect(sessionManager.startSession).toHaveBeenCalledWith(
+      worker.id,
+      expect.objectContaining({ workingDirectory: expect.any(String) })
+    );
+  });
+
+  test('spawns persistent worker with persistent-worker prompt not ephemeral prompt', async () => {
+    const worker = await agentRegistry.registerWorker({
+      name: 'PersistentWorker',
+      workerMode: 'persistent',
+      createdBy: systemEntity,
+      maxConcurrentTasks: 1,
+    });
+
+    const task = await createTask({ title: 'Task for persistent worker', createdBy: systemEntity, status: TaskStatus.OPEN, assignee: worker.id as unknown as EntityId });
+    await api.create(task as unknown as Record<string, unknown> & { createdBy: EntityId });
+
+    await daemon.recoverOrphanedAssignments();
+
+    const startSessionCalls = (sessionManager.startSession as ReturnType<typeof mock>).mock.calls;
+    const workerCall = startSessionCalls.find((c: unknown[]) => (c[0] as string) === (worker.id as unknown as string));
+    const options = workerCall?.[1] as StartSessionOptions | undefined;
+
+    expect(options?.initialPrompt).toContain('Persistent Worker');
+    expect(options?.initialPrompt).not.toContain('Ephemeral Worker');
+  });
+});
+
+// ============================================================================
 // Per-Director Target Branch Propagation
 // ============================================================================
 
