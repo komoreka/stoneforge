@@ -293,6 +293,17 @@ export interface DispatchDaemonConfig {
   readonly idleWorkerSessionReapEnabled?: boolean;
 
   /**
+   * Whether persistent worker session ensuring is enabled.
+   * When enabled, the daemon spawns a standby session for any persistent worker
+   * that has no active session — regardless of task status. This covers the
+   * post-restart case where a worker's tasks have all moved to `review` (so
+   * orphan recovery skips them) but the worker still needs to be available for
+   * new inbox messages.
+   * Default: true
+   */
+  readonly persistentWorkerSessionEnsureEnabled?: boolean;
+
+  /**
    * Callback fired when a session is started by the daemon.
    * Allows the server to attach event savers and save the initial prompt.
    */
@@ -409,6 +420,7 @@ interface NormalizedConfig {
   maxStewardSessionDurationMs: number;
   idleWorkerSessionThresholdMs: number;
   idleWorkerSessionReapEnabled: boolean;
+  persistentWorkerSessionEnsureEnabled: boolean;
   onSessionStarted?: OnSessionStartedCallback;
   projectRoot: string;
   directorInboxForwardingEnabled: boolean;
@@ -492,6 +504,13 @@ export interface DispatchDaemon {
    * they have pending work, so orphan recovery can respawn them fresh.
    */
   reapIdlePersistentWorkerSessions(): Promise<void>;
+
+  /**
+   * Manually triggers persistent worker session ensuring.
+   * Spawns a standby session for every non-disabled persistent worker that has
+   * no active session, regardless of task status.
+   */
+  ensurePersistentWorkerSessions(): Promise<void>;
 
   /**
    * Manually triggers closed-but-unmerged task reconciliation.
@@ -2296,6 +2315,7 @@ export class DispatchDaemonImpl implements DispatchDaemon {
       maxStewardSessionDurationMs: config?.maxStewardSessionDurationMs ?? 30 * 60 * 1000,
       idleWorkerSessionThresholdMs: config?.idleWorkerSessionThresholdMs ?? 30 * 60 * 1000,
       idleWorkerSessionReapEnabled: config?.idleWorkerSessionReapEnabled ?? true,
+      persistentWorkerSessionEnsureEnabled: config?.persistentWorkerSessionEnsureEnabled ?? true,
       onSessionStarted: config?.onSessionStarted,
       projectRoot: config?.projectRoot ?? process.cwd(),
       directorInboxForwardingEnabled: config?.directorInboxForwardingEnabled ?? true,
@@ -2371,6 +2391,16 @@ export class DispatchDaemonImpl implements DispatchDaemon {
       if (this.config.orphanRecoveryEnabled) {
         await this.startupRecoveryDone;
         await this.recoverOrphanedAssignments();
+      }
+
+      // Ensure every persistent worker has a session. Runs after orphan recovery
+      // so task-specific sessions (worktree + task prompt) take precedence; this
+      // only fires for workers that orphan recovery skipped (e.g. all tasks in
+      // review, or no tasks at all). Without this, workers that survive a restart
+      // with all tasks in review never get sessions and can't receive new inbox
+      // messages.
+      if (this.config.persistentWorkerSessionEnsureEnabled) {
+        await this.ensurePersistentWorkerSessions();
       }
 
       // Reap stale sessions before polling for availability
@@ -3451,6 +3481,80 @@ export class DispatchDaemonImpl implements DispatchDaemon {
     });
 
     return true;
+  }
+
+  /**
+   * Ensures every non-disabled persistent worker has an active session.
+   *
+   * Orphan recovery only spawns task-specific sessions for workers whose tasks
+   * are in OPEN or IN_PROGRESS status. After a restart where all of a worker's
+   * tasks have moved to `review` (or the worker has no tasks at all), orphan
+   * recovery silently skips that worker and no session is spawned. The worker
+   * then can't receive inbox messages from the director.
+   *
+   * This method runs after orphan recovery so task-specific sessions take
+   * precedence; it only fires for workers that still have no session after
+   * orphan recovery.
+   */
+  async ensurePersistentWorkerSessions(): Promise<void> {
+    const workers = await this.agentRegistry.listAgents({
+      role: 'worker',
+      workerMode: 'persistent',
+    });
+
+    for (const worker of workers) {
+      if (isAgentDisabled(worker)) continue;
+
+      const workerId = asEntityId(worker.id);
+      const session = this.sessionManager.getActiveSession(workerId);
+      if (session) continue;
+
+      const executableCheck = this.resolveExecutableWithFallback(worker);
+      if (executableCheck === 'all_limited') {
+        logger.debug(
+          `[ensure-persistent-sessions] All executables rate-limited for ${worker.name}, skipping`
+        );
+        continue;
+      }
+
+      try {
+        const roleResult = loadRolePrompt('worker', undefined, {
+          projectRoot: this.config.projectRoot,
+          workerMode: 'persistent',
+        });
+
+        let initialPrompt: string;
+        if (roleResult?.prompt) {
+          const framedRole =
+            'Please read and internalize the following operating instructions. ' +
+            'These define your role and how you should behave in this session:\n\n' +
+            roleResult.prompt;
+          const idSection = `\n\n**Worker ID:** ${workerId}`;
+          const presetSection = this.buildWorkflowPresetContextSection();
+          const presetBlock = presetSection ? `\n\n${presetSection}` : '';
+          initialPrompt = `${framedRole}${idSection}${presetBlock}`;
+        } else {
+          initialPrompt = `**Worker ID:** ${workerId}`;
+        }
+
+        const { session: newSession, events } = await this.sessionManager.startSession(workerId, {
+          workingDirectory: this.config.projectRoot,
+          initialPrompt,
+          executablePathOverride: executableCheck ?? undefined,
+        });
+
+        if (this.config.onSessionStarted) {
+          this.config.onSessionStarted(newSession, events, workerId, initialPrompt);
+        }
+
+        this.emitter.emit('agent:spawned', workerId, this.config.projectRoot);
+        logger.info(`[ensure-persistent-sessions] Spawned standby session for ${worker.name}`);
+        this.operationLog?.write('info', 'recovery', `Spawned standby session for persistent worker ${worker.name}`, { agentId: workerId });
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        logger.warn(`[ensure-persistent-sessions] Failed to spawn session for ${worker.name}: ${errorMessage}`);
+      }
+    }
   }
 
   /**
