@@ -3666,6 +3666,15 @@ export class DispatchDaemonImpl implements DispatchDaemon {
 
         const task = unassigned[0];
 
+        // Re-check: another concurrent operation (Director, CLI) may have
+        // assigned this task between the api.ready() snapshot and now.
+        const freshTask = await this.api.get<Task>(task.id as unknown as ElementId);
+        if (freshTask?.assignee) {
+          logger.debug(`[persistent-worker-dispatch] Task ${task.id} was assigned concurrently, skipping`);
+          unassigned.shift(); // Remove from snapshot so next worker doesn't try again
+          continue;
+        }
+
         try {
           await this.dispatchService.dispatch(task.id, workerId, {
             markAsStarted: false,
