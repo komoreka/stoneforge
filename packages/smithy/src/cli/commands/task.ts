@@ -579,6 +579,21 @@ async function taskMergeHandler(
       await execVerify(`git push origin --delete ${sourceBranch}`, { cwd: workspaceRoot });
     } catch { /* branch may not exist on remote */ }
 
+    // Close the GitHub PR with an explanation. The local squash+push means GitHub
+    // won't auto-detect the merge (squash commits don't match the PR branch),
+    // so we explicitly close it with a note. Using gh pr close avoids an extra
+    // merge commit; a future improvement is to switch to gh pr merge --squash.
+    const prUrl = orchestratorMeta?.mergeRequestUrl;
+    if (prUrl) {
+      try {
+        const commitNote = mergeResult.commitHash ? ` Squash commit: ${mergeResult.commitHash}.` : '';
+        await execVerify(
+          `gh pr close "${prUrl}" --comment "Squash-merged to ${targetBranch} via \`sf task merge\`.${commitNote}"`,
+          { cwd: workspaceRoot }
+        );
+      } catch { /* gh not available or PR already closed — not fatal */ }
+    }
+
     const worktreePath = orchestratorMeta?.worktree;
     if (worktreePath) {
       try {
