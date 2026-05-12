@@ -4241,10 +4241,20 @@ export class DispatchDaemonImpl implements DispatchDaemon {
       try {
         // In session -> forward as user input
         const forwardedContent = await this.formatForwardedMessage(message);
-        await this.sessionManager.messageSession(activeSession.id, {
+        const deliveryResult = await this.sessionManager.messageSession(activeSession.id, {
           content: forwardedContent,
           senderId: message.sender,
         });
+
+        if (!deliveryResult.success) {
+          // PTY write failed (buffer full, session degraded, etc.) — leave inbox
+          // item unread so it can be retried on the next poll cycle. The
+          // idle-reaper will kill and respawn the session if it stays stuck.
+          logger.warn(
+            `Failed to forward inbox message ${item.id} to ${agent.name} (session ${activeSession.id}): ${deliveryResult.error}`
+          );
+          return false;
+        }
 
         this.inboxService.markAsRead(item.id);
         this.emitter.emit('message:forwarded', message.id, agentId);
