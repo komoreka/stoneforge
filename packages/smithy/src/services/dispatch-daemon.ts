@@ -3613,15 +3613,15 @@ export class DispatchDaemonImpl implements DispatchDaemon {
         const lastNotify = this.lastPreAssignedNotifyAt.get(workerId) ?? 0;
         if (Date.now() - lastNotify < NOTIFY_COOLDOWN_MS) continue; // Cooldown active
 
-        const task = openTasks[0];
-        const notice = `**Task assigned to you:** ${task.title} (${task.id})\n\nCheck your task list with \`sf task list --assignee ${workerId}\` and begin working on this task now.`;
+        const assignment = openTasks[0];
+        const notice = `**Task assigned to you:** ${assignment.task.title} (${assignment.taskId})\n\nCheck your task list with \`sf task list --assignee ${workerId}\` and begin working on this task now.`;
         const deliveryResult = await this.sessionManager.messageSession(activeSession.id, {
           content: notice,
           senderId: workerId,
         });
         if (deliveryResult.success) {
           this.lastPreAssignedNotifyAt.set(workerId, Date.now());
-          logger.info(`[persistent-worker-dispatch] Notified ${worker.name} about pre-assigned task ${task.id}`);
+          logger.info(`[persistent-worker-dispatch] Notified ${worker.name} about pre-assigned task ${assignment.taskId}`);
         }
       }
 
