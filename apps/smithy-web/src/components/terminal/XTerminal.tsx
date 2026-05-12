@@ -436,40 +436,40 @@ export const XTerminal = forwardRef<XTerminalHandle, XTerminalProps>(function XT
     };
 
     // Handle agent events
-    const handleAgentEvent = (event: { type: string; data?: unknown; content?: string; output?: string }) => {
+    const handleAgentEvent = (event: { type: string; tool?: { name?: string }; message?: string; output?: string }) => {
       const terminal = terminalRef.current;
       if (!terminal) return;
 
       switch (event.type) {
         case 'assistant':
           // Claude assistant response - may contain content
-          if (event.content) {
-            terminal.write(event.content);
+          if (event.message) {
+            terminal.write(event.message);
           }
           break;
 
         case 'tool_use':
           // Tool invocation
-          terminal.writeln(`\x1b[36m[Tool: ${(event.data as { name?: string })?.name ?? 'unknown'}]\x1b[0m`);
+          terminal.writeln(`\x1b[36m[Tool: ${event.tool?.name ?? 'unknown'}]\x1b[0m`);
           break;
 
         case 'tool_result':
           // Tool result
-          if (event.output) {
-            terminal.writeln(`\x1b[90m${event.output}\x1b[0m`);
+          if (event.message) {
+            terminal.writeln(`\x1b[90m${event.message}\x1b[0m`);
           }
           break;
 
         case 'system':
           // System message
-          if (event.content) {
-            terminal.writeln(`\x1b[33m[System] ${event.content}\x1b[0m`);
+          if (event.message) {
+            terminal.writeln(`\x1b[33m[System] ${event.message}\x1b[0m`);
           }
           break;
 
         case 'error':
           // Error
-          terminal.writeln(`\x1b[31m[Error] ${event.content ?? 'Unknown error'}\x1b[0m`);
+          terminal.writeln(`\x1b[31m[Error] ${event.message ?? 'Unknown error'}\x1b[0m`);
           break;
       }
     };

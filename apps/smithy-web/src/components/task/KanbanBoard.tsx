@@ -57,7 +57,30 @@ interface ColumnFilters {
   assignee: string | null;
   priority: number | null;
   tag: string | null;
+  /**
+   * Filter by orchestrator mergeStatus (e.g. 'awaiting_approval' to see only
+   * tasks with PRs ready for human review). Surfaced on columns where
+   * mergeStatus is meaningful — primarily Awaiting Merge.
+   */
+  mergeStatus: string | null;
 }
+
+/**
+ * Valid values from packages/smithy/src/types/task-meta.ts MergeStatus union.
+ * Kept inline rather than importing to avoid coupling the UI to a deep
+ * server-side import — these strings are stable user-facing taxonomy.
+ */
+const MERGE_STATUS_OPTIONS: { value: string; label: string }[] = [
+  { value: 'pending', label: 'Pending' },
+  { value: 'testing', label: 'Testing' },
+  { value: 'merging', label: 'Merging' },
+  { value: 'awaiting_approval', label: 'Awaiting approval (review)' },
+  { value: 'conflict', label: 'Conflict' },
+  { value: 'test_failed', label: 'Tests failed' },
+  { value: 'failed', label: 'Failed' },
+  { value: 'merged', label: 'Merged' },
+  { value: 'not_applicable', label: 'Not applicable' },
+];
 
 interface ColumnSort {
   field: SortField;
@@ -92,6 +115,7 @@ const DEFAULT_FILTERS: ColumnFilters = {
   assignee: null,
   priority: null,
   tag: null,
+  mergeStatus: null,
 };
 
 const DEFAULT_PAGE_SORT: ColumnSort = {
@@ -212,6 +236,12 @@ function applyFiltersAndSort(
   }
   if (filters.tag) {
     result = result.filter((t) => t.tags?.includes(filters.tag!));
+  }
+  if (filters.mergeStatus) {
+    result = result.filter((t) => {
+      const orcMeta = (t.metadata as { orchestrator?: { mergeStatus?: string } } | undefined)?.orchestrator;
+      return orcMeta?.mergeStatus === filters.mergeStatus;
+    });
   }
 
   // Apply sorting
@@ -411,6 +441,7 @@ function FilterSortDropdown({
     preferences.filters.assignee,
     preferences.filters.priority,
     preferences.filters.tag,
+    preferences.filters.mergeStatus,
   ].filter(Boolean).length;
 
   const hasCustomSort = preferences.sortOverride !== null;
@@ -590,7 +621,7 @@ function FilterSortDropdown({
 
             {/* Tag Filter */}
             {availableTags.length > 0 && (
-              <div className="mb-1">
+              <div className="mb-2">
                 <label className="text-xs text-[var(--color-text-tertiary)] mb-1 block">Tag</label>
                 <select
                   value={preferences.filters.tag ?? ''}
@@ -607,6 +638,33 @@ function FilterSortDropdown({
                   {availableTags.map((tag) => (
                     <option key={tag} value={tag}>
                       {tag}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
+
+            {/* Merge Status Filter (Awaiting Merge column only — mergeStatus is
+                meaningful in REVIEW state where the merge steward is processing
+                the task; pre-merge columns don't carry this metadata yet). */}
+            {columnId === 'awaiting_merge' && (
+              <div className="mb-1">
+                <label className="text-xs text-[var(--color-text-tertiary)] mb-1 block">Merge status</label>
+                <select
+                  value={preferences.filters.mergeStatus ?? ''}
+                  onChange={(e) => onUpdate({
+                    filters: {
+                      ...preferences.filters,
+                      mergeStatus: e.target.value || null,
+                    },
+                  })}
+                  className="w-full text-xs border border-[var(--color-border)] rounded px-2 py-1 focus:outline-none focus:ring-1 focus:ring-[var(--color-primary)] bg-[var(--color-input-bg)] text-[var(--color-text)]"
+                  data-testid={`${columnId}-filter-merge-status`}
+                >
+                  <option value="">All merge statuses</option>
+                  {MERGE_STATUS_OPTIONS.map((opt) => (
+                    <option key={opt.value} value={opt.value}>
+                      {opt.label}
                     </option>
                   ))}
                 </select>
