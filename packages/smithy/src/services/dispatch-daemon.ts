@@ -2418,18 +2418,21 @@ export class DispatchDaemonImpl implements DispatchDaemon {
         await this.ensurePersistentWorkerSessions();
       }
 
-      if (this.config.persistentWorkerDispatchEnabled) {
-        await this.pollPersistentWorkerDispatch();
-      }
-
       // Reap stale sessions before polling for availability
       await this.reapStaleSessions();
 
       // Run polls sequentially to avoid overwhelming the system.
       // Inbox runs first so triage spawns before task dispatch — idle agents
       // process accumulated non-dispatch messages before picking up new tasks.
+      // pollPersistentWorkerDispatch runs after pollInboxes so that workers
+      // appear idle only after any pending dispatch-ack messages have been
+      // processed; stale unread items would otherwise make a worker look busy.
       if (this.config.inboxPollEnabled) {
         await this.pollInboxes();
+      }
+
+      if (this.config.persistentWorkerDispatchEnabled) {
+        await this.pollPersistentWorkerDispatch();
       }
 
       if (this.config.workerAvailabilityPollEnabled) {
@@ -3591,6 +3594,14 @@ export class DispatchDaemonImpl implements DispatchDaemon {
         workerMode: 'persistent',
       });
 
+      // Snapshot unassigned ready tasks once before the loop so all workers see
+      // the same queue. Dispatching removes items from this local list via
+      // shift(), matching the pollWorkflowTasks pattern (sortedReviewTasks.shift()).
+      // Calling api.ready() per-worker would open a race window where two workers
+      // could each see the same task before either dispatch() commits.
+      const readyTasks = await this.api.ready({ includeEphemeral: true });
+      const unassigned = readyTasks.filter((t) => !t.assignee);
+
       for (const worker of workers) {
         if (isAgentDisabled(worker)) continue;
 
@@ -3609,9 +3620,9 @@ export class DispatchDaemonImpl implements DispatchDaemon {
         });
         if (unread.length > 0) continue;
 
-        // Find unassigned ready tasks
-        const readyTasks = await this.api.ready({ includeEphemeral: true });
-        const unassigned = readyTasks.filter((t) => !t.assignee);
+        // Queue is drained — no point checking remaining workers.
+        // break is correct here (not continue): all subsequent workers would also
+        // find an empty queue.
         if (unassigned.length === 0) break;
 
         const execCheck = this.resolveExecutableWithFallback(worker);
@@ -3625,9 +3636,14 @@ export class DispatchDaemonImpl implements DispatchDaemon {
         const task = unassigned[0];
 
         try {
+          // Relies on ensurePersistentWorkerSessions having already run this cycle
+          // (default placement: after orphan recovery, before this call). If no session
+          // exists for this worker, the inbox message will sit unread until orphan
+          // recovery or the next ensure-sessions pass spawns one (typically one cycle).
           await this.dispatchService.dispatch(task.id, workerId, {
             markAsStarted: false,
           });
+          unassigned.shift();
           this.emitter.emit('task:dispatched', task.id, workerId);
           logger.info(
             `[persistent-worker-dispatch] Dispatched task ${task.id} ("${task.title}") to ${worker.name}`
@@ -3639,6 +3655,7 @@ export class DispatchDaemonImpl implements DispatchDaemon {
           const errorMessage = error instanceof Error ? error.message : String(error);
           errorMessages.push(`Worker ${worker.name}: ${errorMessage}`);
           logger.error(`[persistent-worker-dispatch] Failed to dispatch task ${task.id} to ${worker.name}:`, error);
+          this.operationLog?.write('warn', 'dispatch', `Failed to dispatch task ${task.id} to persistent worker ${worker.name}: ${errorMessage}`, { taskId: task.id, agentId: workerId });
         }
       }
     } catch (error) {
