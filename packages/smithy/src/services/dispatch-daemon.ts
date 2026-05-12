@@ -3624,6 +3624,28 @@ export class DispatchDaemonImpl implements DispatchDaemon {
         if (Date.now() - lastNotify < NOTIFY_COOLDOWN_MS) continue; // Cooldown active
 
         const assignment = openTasks[0];
+
+        // If the canonical assignee (task.assignee) differs from the metadata's
+        // assignedAgent, the task was re-routed via sf task assign (quarry) without
+        // updating orchestratorMeta. Re-sync now so the worker receives the correct
+        // branch/worktree and doesn't inherit a stale branch pre-allocated for a
+        // different agent (Bug 5 — metadata.branch speculatively pre-allocated).
+        if (assignment.orchestratorMeta?.assignedAgent !== workerId) {
+          try {
+            await this.taskAssignment.assignToAgent(assignment.taskId, workerId);
+            logger.info(
+              `[persistent-worker-dispatch] Resynced stale metadata for ${assignment.taskId}: ` +
+              `assignedAgent was ${String(assignment.orchestratorMeta?.assignedAgent)}, now ${worker.name}`
+            );
+          } catch (syncError) {
+            logger.warn(
+              `[persistent-worker-dispatch] Metadata resync failed for ${assignment.taskId}:`,
+              syncError
+            );
+            // Non-fatal: proceed with notification even if resync fails
+          }
+        }
+
         const notice = `**Task assigned to you:** ${assignment.task.title} (${assignment.taskId})\n\nCheck your task list with \`sf task list --assignee ${workerId}\` and begin working on this task now.`;
         const deliveryResult = await this.sessionManager.messageSession(activeSession.id, {
           content: notice,

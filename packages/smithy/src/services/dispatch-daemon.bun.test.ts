@@ -7807,4 +7807,55 @@ describe('pollPersistentWorkerDispatch', () => {
 
     expect(result.processed).toBe(0);
   });
+
+  test('Pass 1 resyncs stale orchestratorMeta when task.assignee differs from assignedAgent (Bug 5 quarry-path variant)', async () => {
+    // Scenario: daemon dispatched to CodeAdmin first (set orchestratorMeta.assignedAgent
+    // + orchestratorMeta.branch to CodeAdmin's values). Director then used sf task assign
+    // (quarry) to re-route to CodeDelivery, updating only task.assignee. Pass 1 must
+    // resync metadata before notifying CodeDelivery so they receive the correct branch.
+    const codeAdmin = await agentRegistry.registerWorker({
+      name: 'StaleRecipientAdmin',
+      workerMode: 'persistent',
+      createdBy: systemEntity,
+      maxConcurrentTasks: 1,
+    });
+    const codeDelivery = await agentRegistry.registerWorker({
+      name: 'CanonicalDelivery',
+      workerMode: 'persistent',
+      createdBy: systemEntity,
+      maxConcurrentTasks: 1,
+    });
+
+    // Create a task already assigned to CodeDelivery (canonical assignee)
+    const raw = await createTask({
+      title: 'Bug 5 quarry-path task',
+      createdBy: systemEntity,
+      status: TaskStatus.OPEN,
+      assignee: codeDelivery.id as unknown as EntityId,
+    });
+    const saved = await api.create(raw as unknown as Record<string, unknown> & { createdBy: EntityId }) as import('@stoneforge/core').Task;
+
+    // Inject stale orchestratorMeta: metadata still points at CodeAdmin (first dispatch recipient)
+    await api.update(saved.id as unknown as import('@stoneforge/core').ElementId, {
+      metadata: updateOrchestratorTaskMeta(undefined, {
+        assignedAgent: codeAdmin.id as unknown as EntityId,
+        branch: `agent/stalereciplentadmin/${saved.id}-bug5-task`,
+        worktree: `.stoneforge/.worktrees/stalereciplentadmin-bug5-task`,
+      }),
+    });
+
+    // Ensure CodeDelivery has an active session (Pass 1 checks for this before notifying)
+    await (sessionManager as ReturnType<typeof createMockSessionManager>).startSession(
+      codeDelivery.id as unknown as EntityId
+    );
+
+    await daemon.pollPersistentWorkerDispatch();
+
+    // After the poll, orchestratorMeta should reflect CodeDelivery's branch, not CodeAdmin's
+    const updated = await api.get<import('@stoneforge/core').Task>(saved.id as unknown as import('@stoneforge/core').ElementId);
+    const meta = getOrchestratorTaskMeta(updated!.metadata as Record<string, unknown> | undefined);
+    expect(meta!.assignedAgent).toBe(codeDelivery.id);
+    expect(meta!.branch).toContain('canonicaldelivery');  // branch derived from new agent name
+    expect(meta!.branch).not.toContain('stalereciplentadmin');
+  });
 });
