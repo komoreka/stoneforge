@@ -262,6 +262,25 @@ export interface DispatchDaemonConfig {
   readonly maxStewardSessionDurationMs?: number;
 
   /**
+   * Threshold in milliseconds beyond which an idle persistent worker session
+   * with pending work is considered stale and killed so orphan recovery can
+   * respawn it fresh. Only triggers when the session has assigned tasks or
+   * unread inbox items — idle-but-empty sessions are left alone.
+   * Default: 1800000 (30 minutes).
+   */
+  readonly idleWorkerSessionThresholdMs?: number;
+
+  /**
+   * Whether idle persistent worker session reaping is enabled.
+   * When enabled, sessions idle beyond idleWorkerSessionThresholdMs that have
+   * pending work are stopped and orphan recovery respawns them with a fresh
+   * context. Handles cases such as lost auth ("Not logged in") where the
+   * process is alive but the session will never make progress.
+   * Default: true
+   */
+  readonly idleWorkerSessionReapEnabled?: boolean;
+
+  /**
    * Callback fired when a session is started by the daemon.
    * Allows the server to attach event savers and save the initial prompt.
    */
@@ -333,6 +352,8 @@ interface NormalizedConfig {
   maxResumeAttemptsBeforeRecovery: number;
   maxSessionDurationMs: number;
   maxStewardSessionDurationMs: number;
+  idleWorkerSessionThresholdMs: number;
+  idleWorkerSessionReapEnabled: boolean;
   onSessionStarted?: OnSessionStartedCallback;
   projectRoot: string;
   directorInboxForwardingEnabled: boolean;
@@ -408,6 +429,13 @@ export interface DispatchDaemon {
    * and re-spawns sessions to continue the work.
    */
   recoverOrphanedAssignments(): Promise<PollResult>;
+
+  /**
+   * Manually triggers idle persistent worker session reaping.
+   * Stops sessions that have been idle beyond the configured threshold while
+   * they have pending work, so orphan recovery can respawn them fresh.
+   */
+  reapIdlePersistentWorkerSessions(): Promise<void>;
 
   /**
    * Manually triggers closed-but-unmerged task reconciliation.
@@ -2022,6 +2050,8 @@ export class DispatchDaemonImpl implements DispatchDaemon {
       maxResumeAttemptsBeforeRecovery: config?.maxResumeAttemptsBeforeRecovery ?? 3,
       maxSessionDurationMs: config?.maxSessionDurationMs ?? 0,
       maxStewardSessionDurationMs: config?.maxStewardSessionDurationMs ?? 30 * 60 * 1000,
+      idleWorkerSessionThresholdMs: config?.idleWorkerSessionThresholdMs ?? 30 * 60 * 1000,
+      idleWorkerSessionReapEnabled: config?.idleWorkerSessionReapEnabled ?? true,
       onSessionStarted: config?.onSessionStarted,
       projectRoot: config?.projectRoot ?? process.cwd(),
       directorInboxForwardingEnabled: config?.directorInboxForwardingEnabled ?? true,
@@ -2077,6 +2107,13 @@ export class DispatchDaemonImpl implements DispatchDaemon {
       if (this.rateLimitSleepTimer) {
         clearTimeout(this.rateLimitSleepTimer);
         this.rateLimitSleepTimer = undefined;
+      }
+
+      // Reap idle persistent worker sessions before orphan recovery so that
+      // sessions stuck in bad state (e.g. lost auth) are killed first, making
+      // them immediately eligible for respawn in the same cycle.
+      if (this.config.idleWorkerSessionReapEnabled) {
+        await this.reapIdlePersistentWorkerSessions();
       }
 
       // Recover orphaned assignments first — workers with tasks but no session
@@ -2200,6 +2237,65 @@ export class DispatchDaemonImpl implements DispatchDaemon {
    * - `maxStewardSessionDurationMs` — stricter limit for steward sessions
    *   (default 30 minutes), which are expected to be short-lived
    */
+  /**
+   * Kills persistent worker sessions that have been idle too long while they
+   * have pending work (assigned tasks or unread inbox items). Orphan recovery,
+   * which runs in the same cycle immediately after, respawns them with a fresh
+   * context.
+   *
+   * The canonical trigger is a session whose Claude process lost authentication
+   * ("Not logged in") — the process is alive so orphan recovery would skip it,
+   * but it will never make progress. Activity-timeout detection catches this
+   * and any other silent-stall pattern without requiring PTY output parsing.
+   */
+  async reapIdlePersistentWorkerSessions(): Promise<void> {
+    const thresholdMs = this.config.idleWorkerSessionThresholdMs;
+    const now = Date.now();
+
+    const workers = await this.agentRegistry.listAgents({
+      role: 'worker',
+      workerMode: 'persistent',
+    });
+
+    for (const worker of workers) {
+      if (isAgentDisabled(worker)) continue;
+
+      const workerId = asEntityId(worker.id);
+      const session = this.sessionManager.getActiveSession(workerId);
+      if (!session || session.status !== 'running') continue;
+
+      const lastActivity = new Date(session.lastActivityAt).getTime();
+      const idleMs = now - lastActivity;
+      if (idleMs < thresholdMs) continue;
+
+      // Only reap when there is work waiting — idle-but-empty sessions are fine.
+      const [workerTasks, inboxItems] = await Promise.all([
+        this.taskAssignment.getAgentTasks(workerId, {
+          taskStatus: [TaskStatus.OPEN, TaskStatus.IN_PROGRESS],
+        }),
+        Promise.resolve(
+          this.inboxService.getInbox(workerId, { status: InboxStatus.UNREAD, limit: 1 })
+        ),
+      ]);
+
+      if (workerTasks.length === 0 && inboxItems.length === 0) continue;
+
+      const idleMin = Math.round(idleMs / 60_000);
+      const reason = `Idle session with pending work — ${idleMin}m since last activity. Respawning for fresh context.`;
+      logger.warn(`[idle-worker-reap] ${worker.name}: ${reason}`);
+      this.operationLog?.write('warn', 'recovery', reason, { agentId: workerId });
+
+      try {
+        await this.sessionManager.stopSession(session.id, { graceful: false, reason });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!message.includes('not found')) {
+          logger.warn(`[idle-worker-reap] Failed to stop session for ${worker.name}:`, error);
+        }
+      }
+    }
+  }
+
   private async reapStaleSessions(): Promise<void> {
     const hasGeneralLimit = this.config.maxSessionDurationMs > 0;
     const hasStewardLimit = this.config.maxStewardSessionDurationMs > 0;

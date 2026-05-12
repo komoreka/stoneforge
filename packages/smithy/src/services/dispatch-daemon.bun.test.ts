@@ -6173,6 +6173,462 @@ describe('assignTaskToWorker - missing agent channel resilience', () => {
 });
 
 // ============================================================================
+<<<<<<< Updated upstream
+=======
+// Persistent Worker Orphan Recovery + Prompt Selection
+// ============================================================================
+
+describe('recoverOrphanedAssignments - persistent worker support', () => {
+  let api: QuarryAPI;
+  let inboxService: InboxService;
+  let agentRegistry: AgentRegistry;
+  let taskAssignment: TaskAssignmentService;
+  let dispatchService: DispatchService;
+  let sessionManager: SessionManager;
+  let worktreeManager: WorktreeManager;
+  let stewardScheduler: StewardScheduler;
+  let daemon: DispatchDaemon;
+  let testDbPath: string;
+  let systemEntity: EntityId;
+
+  beforeEach(async () => {
+    testDbPath = `/tmp/dispatch-daemon-persistent-test-${Date.now()}-${Math.random().toString(36).slice(2)}.db`;
+    const storage = createStorage({ path: testDbPath, create: true });
+    initializeSchema(storage);
+
+    api = createQuarryAPI(storage);
+    inboxService = createInboxService(storage);
+    agentRegistry = createAgentRegistry(api);
+    taskAssignment = createTaskAssignmentService(api);
+    dispatchService = createDispatchService(api, taskAssignment, agentRegistry);
+    sessionManager = createMockSessionManager();
+    worktreeManager = createMockWorktreeManager();
+    stewardScheduler = createMockStewardScheduler();
+
+    const { createEntity, EntityTypeValue } = await import('@stoneforge/core');
+    const entity = await createEntity({
+      name: 'test-system',
+      entityType: EntityTypeValue.SYSTEM,
+      createdBy: 'system:test' as EntityId,
+    });
+    const saved = await api.create(entity as unknown as Record<string, unknown> & { createdBy: EntityId });
+    systemEntity = saved.id as unknown as EntityId;
+
+    daemon = createDispatchDaemon(
+      api, agentRegistry, sessionManager, dispatchService,
+      worktreeManager, taskAssignment, stewardScheduler, inboxService,
+      { ensureTargetBranchExists: mockEnsureTargetBranchExists, pollIntervalMs: 100,
+        workerAvailabilityPollEnabled: false, inboxPollEnabled: false,
+        stewardTriggerPollEnabled: false, workflowTaskPollEnabled: false }
+    );
+  });
+
+  afterEach(async () => {
+    await daemon.stop();
+    if (fs.existsSync(testDbPath)) fs.unlinkSync(testDbPath);
+  });
+
+  test('recovers persistent worker with assigned task and no prior session', async () => {
+    const worker = await agentRegistry.registerWorker({
+      name: 'PersistentWorker',
+      workerMode: 'persistent',
+      createdBy: systemEntity,
+      maxConcurrentTasks: 1,
+    });
+
+    const task = await createTask({ title: 'Task for persistent worker', createdBy: systemEntity, status: TaskStatus.OPEN, assignee: worker.id as unknown as EntityId });
+    await api.create(task as unknown as Record<string, unknown> & { createdBy: EntityId });
+
+    const result = await daemon.recoverOrphanedAssignments();
+
+    expect(result.processed).toBe(1);
+    expect(sessionManager.startSession).toHaveBeenCalledWith(
+      worker.id,
+      expect.objectContaining({ workingDirectory: expect.any(String) })
+    );
+  });
+
+  test('spawns persistent worker with persistent-worker prompt not ephemeral prompt', async () => {
+    const worker = await agentRegistry.registerWorker({
+      name: 'PersistentWorker',
+      workerMode: 'persistent',
+      createdBy: systemEntity,
+      maxConcurrentTasks: 1,
+    });
+
+    const task = await createTask({ title: 'Task for persistent worker', createdBy: systemEntity, status: TaskStatus.OPEN, assignee: worker.id as unknown as EntityId });
+    await api.create(task as unknown as Record<string, unknown> & { createdBy: EntityId });
+
+    await daemon.recoverOrphanedAssignments();
+
+    const startSessionCalls = (sessionManager.startSession as ReturnType<typeof mock>).mock.calls;
+    const workerCall = startSessionCalls.find((c: unknown[]) => (c[0] as string) === (worker.id as unknown as string));
+    const options = workerCall?.[1] as StartSessionOptions | undefined;
+
+    expect(options?.initialPrompt).toContain('Persistent Worker');
+    expect(options?.initialPrompt).not.toContain('Ephemeral Worker');
+  });
+});
+
+// ============================================================================
+// recoverOrphanedAssignments — Director orphan recovery (Phase 0)
+// ============================================================================
+
+describe('recoverOrphanedAssignments - director orphan recovery', () => {
+  let api: QuarryAPI;
+  let inboxService: InboxService;
+  let agentRegistry: AgentRegistry;
+  let taskAssignment: TaskAssignmentService;
+  let dispatchService: DispatchService;
+  let sessionManager: ReturnType<typeof createMockSessionManager>;
+  let worktreeManager: WorktreeManager;
+  let stewardScheduler: StewardScheduler;
+  let daemon: DispatchDaemon;
+  let testDbPath: string;
+  let systemEntity: EntityId;
+
+  beforeEach(async () => {
+    testDbPath = `/tmp/dispatch-daemon-director-recovery-test-${Date.now()}-${Math.random().toString(36).slice(2)}.db`;
+    const storage = createStorage({ path: testDbPath, create: true });
+    initializeSchema(storage);
+
+    api = createQuarryAPI(storage);
+    inboxService = createInboxService(storage);
+    agentRegistry = createAgentRegistry(api);
+    taskAssignment = createTaskAssignmentService(api);
+    dispatchService = createDispatchService(api, taskAssignment, agentRegistry);
+    sessionManager = createMockSessionManager();
+    worktreeManager = createMockWorktreeManager();
+    stewardScheduler = createMockStewardScheduler();
+
+    const { createEntity, EntityTypeValue } = await import('@stoneforge/core');
+    const entity = await createEntity({
+      name: 'test-system',
+      entityType: EntityTypeValue.SYSTEM,
+      createdBy: 'system:test' as EntityId,
+    });
+    const saved = await api.create(entity as unknown as Record<string, unknown> & { createdBy: EntityId });
+    systemEntity = saved.id as unknown as EntityId;
+
+    daemon = createDispatchDaemon(
+      api,
+      agentRegistry,
+      sessionManager as unknown as SessionManager,
+      dispatchService,
+      worktreeManager,
+      taskAssignment,
+      stewardScheduler,
+      inboxService,
+      { pollIntervalMs: 5000 }
+    );
+  });
+
+  afterEach(async () => {
+    await daemon.stop();
+    if (fs.existsSync(testDbPath)) fs.unlinkSync(testDbPath);
+  });
+
+  test('respawns director when session has terminated', async () => {
+    const director = await agentRegistry.registerDirector({
+      name: 'TestDirector',
+      createdBy: systemEntity,
+    });
+    const directorId = director.id as unknown as EntityId;
+
+    const result = await daemon.recoverOrphanedAssignments();
+
+    expect(result.processed).toBeGreaterThanOrEqual(1);
+    expect(sessionManager.startSession).toHaveBeenCalledWith(
+      directorId,
+      expect.objectContaining({ workingDirectory: expect.any(String) })
+    );
+  });
+
+  test('does not respawn director when session is active', async () => {
+    const director = await agentRegistry.registerDirector({
+      name: 'ActiveDirector',
+      createdBy: systemEntity,
+    });
+    const directorId = director.id as unknown as EntityId;
+
+    await sessionManager.startSession(directorId, { workingDirectory: '/tmp' });
+    const callsBefore = (sessionManager.startSession as ReturnType<typeof mock>).mock.calls.length;
+
+    await daemon.recoverOrphanedAssignments();
+
+    const callsAfter = (sessionManager.startSession as ReturnType<typeof mock>).mock.calls.length;
+    expect(callsAfter).toBe(callsBefore);
+  });
+
+  test('initial prompt contains director role framing and director ID', async () => {
+    const director = await agentRegistry.registerDirector({
+      name: 'PromptCheckDirector',
+      createdBy: systemEntity,
+    });
+    const directorId = director.id as unknown as EntityId;
+
+    await daemon.recoverOrphanedAssignments();
+
+    const calls = (sessionManager.startSession as ReturnType<typeof mock>).mock.calls;
+    const call = calls.find((c: unknown[]) => c[0] === directorId);
+    const options = call?.[1] as StartSessionOptions | undefined;
+
+    expect(options?.initialPrompt).toContain('Director ID');
+    expect(options?.initialPrompt).toContain(directorId);
+  });
+});
+
+// ============================================================================
+// Idle Persistent Worker Session Reaping
+// ============================================================================
+
+describe('reapIdlePersistentWorkerSessions', () => {
+  let api: QuarryAPI;
+  let inboxService: InboxService;
+  let agentRegistry: AgentRegistry;
+  let taskAssignment: TaskAssignmentService;
+  let dispatchService: DispatchService;
+  let sessionManager: SessionManager;
+  let worktreeManager: WorktreeManager;
+  let stewardScheduler: StewardScheduler;
+  let daemon: DispatchDaemon;
+  let testDbPath: string;
+  let systemEntity: EntityId;
+
+  beforeEach(async () => {
+    testDbPath = `/tmp/dispatch-daemon-idle-reap-test-${Date.now()}-${Math.random().toString(36).slice(2)}.db`;
+    const storage = createStorage({ path: testDbPath, create: true });
+    initializeSchema(storage);
+
+    api = createQuarryAPI(storage);
+    inboxService = createInboxService(storage);
+    agentRegistry = createAgentRegistry(api);
+    taskAssignment = createTaskAssignmentService(api);
+    dispatchService = createDispatchService(api, taskAssignment, agentRegistry);
+    sessionManager = createMockSessionManager();
+    worktreeManager = createMockWorktreeManager();
+    stewardScheduler = createMockStewardScheduler();
+
+    const { createEntity, EntityTypeValue } = await import('@stoneforge/core');
+    const entity = await createEntity({
+      name: 'test-system',
+      entityType: EntityTypeValue.SYSTEM,
+      createdBy: 'system:test' as EntityId,
+    });
+    const saved = await api.create(entity as unknown as Record<string, unknown> & { createdBy: EntityId });
+    systemEntity = saved.id as unknown as EntityId;
+  });
+
+  afterEach(async () => {
+    await daemon.stop();
+    if (fs.existsSync(testDbPath)) fs.unlinkSync(testDbPath);
+  });
+
+  test('stops idle persistent worker session that has an assigned task', async () => {
+    daemon = createDispatchDaemon(
+      api, agentRegistry, sessionManager, dispatchService,
+      worktreeManager, taskAssignment, stewardScheduler, inboxService,
+      {
+        ensureTargetBranchExists: mockEnsureTargetBranchExists,
+        pollIntervalMs: 100,
+        workerAvailabilityPollEnabled: false, inboxPollEnabled: false,
+        stewardTriggerPollEnabled: false, workflowTaskPollEnabled: false,
+        orphanRecoveryEnabled: false,
+        idleWorkerSessionThresholdMs: 50,
+      }
+    );
+
+    const worker = await agentRegistry.registerWorker({
+      name: 'IdleDelivery',
+      workerMode: 'persistent',
+      createdBy: systemEntity,
+      maxConcurrentTasks: 1,
+    });
+    const workerId = worker.id as unknown as EntityId;
+
+    // Create and assign a task
+    const task = await createTask({ title: 'Idle task', createdBy: systemEntity, status: TaskStatus.OPEN, assignee: workerId });
+    await api.create(task as unknown as Record<string, unknown> & { createdBy: EntityId });
+
+    // Fake an active session with stale lastActivityAt (100ms ago, threshold is 50ms)
+    const staleTimestamp = new Date(Date.now() - 100).toISOString();
+    const fakeSession = {
+      id: 'session-idle-001',
+      agentId: workerId,
+      agentRole: 'worker' as const,
+      workerMode: 'persistent' as const,
+      mode: 'interactive' as const,
+      status: 'running' as const,
+      workingDirectory: '/tmp',
+      createdAt: staleTimestamp,
+      lastActivityAt: staleTimestamp,
+    };
+    (sessionManager.getActiveSession as ReturnType<typeof mock>).mockImplementation((id: EntityId) =>
+      id === workerId ? fakeSession : undefined
+    );
+
+    await (daemon as DispatchDaemonImpl).reapIdlePersistentWorkerSessions();
+
+    expect(sessionManager.stopSession).toHaveBeenCalledWith(
+      'session-idle-001',
+      expect.objectContaining({ graceful: false })
+    );
+  });
+
+  test('does not stop session when worker has no pending work', async () => {
+    daemon = createDispatchDaemon(
+      api, agentRegistry, sessionManager, dispatchService,
+      worktreeManager, taskAssignment, stewardScheduler, inboxService,
+      {
+        ensureTargetBranchExists: mockEnsureTargetBranchExists,
+        pollIntervalMs: 100,
+        workerAvailabilityPollEnabled: false, inboxPollEnabled: false,
+        stewardTriggerPollEnabled: false, workflowTaskPollEnabled: false,
+        orphanRecoveryEnabled: false,
+        idleWorkerSessionThresholdMs: 50,
+      }
+    );
+
+    const worker = await agentRegistry.registerWorker({
+      name: 'IdleEmpty',
+      workerMode: 'persistent',
+      createdBy: systemEntity,
+      maxConcurrentTasks: 1,
+    });
+    const workerId = worker.id as unknown as EntityId;
+
+    // No tasks assigned, no inbox messages
+    const staleTimestamp = new Date(Date.now() - 100).toISOString();
+    const fakeSession = {
+      id: 'session-idle-002',
+      agentId: workerId,
+      agentRole: 'worker' as const,
+      workerMode: 'persistent' as const,
+      mode: 'interactive' as const,
+      status: 'running' as const,
+      workingDirectory: '/tmp',
+      createdAt: staleTimestamp,
+      lastActivityAt: staleTimestamp,
+    };
+    (sessionManager.getActiveSession as ReturnType<typeof mock>).mockImplementation((id: EntityId) =>
+      id === workerId ? fakeSession : undefined
+    );
+
+    await (daemon as DispatchDaemonImpl).reapIdlePersistentWorkerSessions();
+
+    expect(sessionManager.stopSession).not.toHaveBeenCalled();
+  });
+
+  test('does not stop session that is within the idle threshold', async () => {
+    daemon = createDispatchDaemon(
+      api, agentRegistry, sessionManager, dispatchService,
+      worktreeManager, taskAssignment, stewardScheduler, inboxService,
+      {
+        ensureTargetBranchExists: mockEnsureTargetBranchExists,
+        pollIntervalMs: 100,
+        workerAvailabilityPollEnabled: false, inboxPollEnabled: false,
+        stewardTriggerPollEnabled: false, workflowTaskPollEnabled: false,
+        orphanRecoveryEnabled: false,
+        idleWorkerSessionThresholdMs: 5000, // 5 seconds threshold
+      }
+    );
+
+    const worker = await agentRegistry.registerWorker({
+      name: 'RecentlyActive',
+      workerMode: 'persistent',
+      createdBy: systemEntity,
+      maxConcurrentTasks: 1,
+    });
+    const workerId = worker.id as unknown as EntityId;
+
+    const task = await createTask({ title: 'Active task', createdBy: systemEntity, status: TaskStatus.OPEN, assignee: workerId });
+    await api.create(task as unknown as Record<string, unknown> & { createdBy: EntityId });
+
+    // Session was active 100ms ago — well within 5s threshold
+    const recentTimestamp = new Date(Date.now() - 100).toISOString();
+    const fakeSession = {
+      id: 'session-active-001',
+      agentId: workerId,
+      agentRole: 'worker' as const,
+      workerMode: 'persistent' as const,
+      mode: 'interactive' as const,
+      status: 'running' as const,
+      workingDirectory: '/tmp',
+      createdAt: recentTimestamp,
+      lastActivityAt: recentTimestamp,
+    };
+    (sessionManager.getActiveSession as ReturnType<typeof mock>).mockImplementation((id: EntityId) =>
+      id === workerId ? fakeSession : undefined
+    );
+
+    await (daemon as DispatchDaemonImpl).reapIdlePersistentWorkerSessions();
+
+    expect(sessionManager.stopSession).not.toHaveBeenCalled();
+  });
+
+  test('reap followed by tick triggers orphan recovery respawn', async () => {
+    daemon = createDispatchDaemon(
+      api, agentRegistry, sessionManager, dispatchService,
+      worktreeManager, taskAssignment, stewardScheduler, inboxService,
+      {
+        ensureTargetBranchExists: mockEnsureTargetBranchExists,
+        pollIntervalMs: 100,
+        workerAvailabilityPollEnabled: false, inboxPollEnabled: false,
+        stewardTriggerPollEnabled: false, workflowTaskPollEnabled: false,
+        idleWorkerSessionThresholdMs: 50,
+      }
+    );
+
+    const worker = await agentRegistry.registerWorker({
+      name: 'RespawnMe',
+      workerMode: 'persistent',
+      createdBy: systemEntity,
+      maxConcurrentTasks: 1,
+    });
+    const workerId = worker.id as unknown as EntityId;
+
+    const task = await createTask({ title: 'Respawn task', createdBy: systemEntity, status: TaskStatus.OPEN, assignee: workerId });
+    await api.create(task as unknown as Record<string, unknown> & { createdBy: EntityId });
+
+    // First getActiveSession call returns stale session (triggers reap).
+    // After stopSession, getActiveSession returns undefined (session is dead).
+    // This makes the worker eligible for orphan recovery respawn.
+    const staleTimestamp = new Date(Date.now() - 100).toISOString();
+    const fakeSession = {
+      id: 'session-respawn-001',
+      agentId: workerId,
+      agentRole: 'worker' as const,
+      workerMode: 'persistent' as const,
+      mode: 'interactive' as const,
+      status: 'running' as const,
+      workingDirectory: '/tmp',
+      createdAt: staleTimestamp,
+      lastActivityAt: staleTimestamp,
+    };
+    let sessionAlive = true;
+    (sessionManager.getActiveSession as ReturnType<typeof mock>).mockImplementation((id: EntityId) => {
+      if (id !== workerId) return undefined;
+      return sessionAlive ? fakeSession : undefined;
+    });
+    (sessionManager.stopSession as ReturnType<typeof mock>).mockImplementation(async () => {
+      sessionAlive = false;
+    });
+
+    await daemon.tick();
+
+    expect(sessionManager.stopSession).toHaveBeenCalledWith(
+      'session-respawn-001',
+      expect.objectContaining({ graceful: false })
+    );
+    expect(sessionManager.startSession).toHaveBeenCalledWith(
+      workerId,
+      expect.objectContaining({ workingDirectory: expect.any(String) })
+    );
+  });
+});
+
+// ============================================================================
+>>>>>>> Stashed changes
 // Per-Director Target Branch Propagation
 // ============================================================================
 
