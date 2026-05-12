@@ -3636,10 +3636,6 @@ export class DispatchDaemonImpl implements DispatchDaemon {
         const task = unassigned[0];
 
         try {
-          // Relies on ensurePersistentWorkerSessions having already run this cycle
-          // (default placement: after orphan recovery, before this call). If no session
-          // exists for this worker, the inbox message will sit unread until orphan
-          // recovery or the next ensure-sessions pass spawns one (typically one cycle).
           await this.dispatchService.dispatch(task.id, workerId, {
             markAsStarted: false,
           });
@@ -3650,6 +3646,23 @@ export class DispatchDaemonImpl implements DispatchDaemon {
           );
           this.operationLog?.write('info', 'dispatch', `Auto-dispatched task ${task.id} to persistent worker ${worker.name}`, { taskId: task.id, agentId: workerId });
           processed++;
+
+          // dispatchService.dispatch() uses suppressInbox: true so the notification
+          // won't reach the worker via pollInboxes. Directly message the active
+          // session instead — same mechanism as processPersistentAgentMessage.
+          const activeSession = this.sessionManager.getActiveSession(workerId);
+          if (activeSession) {
+            const notice = `**Task dispatched to you:** ${task.title} (${task.id})\n\nCheck your task list with \`sf task list --assignee ${workerId}\` and begin working on this task now.`;
+            const deliveryResult = await this.sessionManager.messageSession(activeSession.id, {
+              content: notice,
+              senderId: workerId,
+            });
+            if (!deliveryResult.success) {
+              logger.warn(
+                `[persistent-worker-dispatch] Session message to ${worker.name} failed: ${deliveryResult.error}. Worker will see task on next inbox poll.`
+              );
+            }
+          }
         } catch (error) {
           errors++;
           const errorMessage = error instanceof Error ? error.message : String(error);
