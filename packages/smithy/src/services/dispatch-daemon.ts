@@ -700,6 +700,7 @@ export class DispatchDaemonImpl implements DispatchDaemon {
    * Items are added before forwarding and removed after markAsRead() completes.
    */
   private readonly forwardingInboxItems = new Set<string>();
+  private readonly lastPreAssignedNotifyAt = new Map<string, number>();
 
   /**
    * Resolves once the startup background orphan recovery has completed (or
@@ -3594,6 +3595,36 @@ export class DispatchDaemonImpl implements DispatchDaemon {
         workerMode: 'persistent',
       });
 
+      // Pass 1: Notify workers about pre-assigned OPEN tasks they haven't started.
+      // Covers tasks assigned via `sf task assign`, `sf task handoff --to`, or Director
+      // dispatch that bypassed the daemon. Runs every 30s per worker to avoid spamming.
+      const NOTIFY_COOLDOWN_MS = 30_000;
+      for (const worker of workers) {
+        if (isAgentDisabled(worker)) continue;
+        const workerId = asEntityId(worker.id);
+        const activeSession = this.sessionManager.getActiveSession(workerId);
+        if (!activeSession) continue; // No session to notify
+
+        const openTasks = await this.taskAssignment.getAgentTasks(workerId, {
+          taskStatus: [TaskStatus.OPEN],
+        });
+        if (openTasks.length === 0) continue; // No OPEN tasks assigned
+
+        const lastNotify = this.lastPreAssignedNotifyAt.get(workerId) ?? 0;
+        if (Date.now() - lastNotify < NOTIFY_COOLDOWN_MS) continue; // Cooldown active
+
+        const task = openTasks[0];
+        const notice = `**Task assigned to you:** ${task.title} (${task.id})\n\nCheck your task list with \`sf task list --assignee ${workerId}\` and begin working on this task now.`;
+        const deliveryResult = await this.sessionManager.messageSession(activeSession.id, {
+          content: notice,
+          senderId: workerId,
+        });
+        if (deliveryResult.success) {
+          this.lastPreAssignedNotifyAt.set(workerId, Date.now());
+          logger.info(`[persistent-worker-dispatch] Notified ${worker.name} about pre-assigned task ${task.id}`);
+        }
+      }
+
       // Snapshot unassigned ready tasks once before the loop so all workers see
       // the same queue. Dispatching removes items from this local list via
       // shift(), matching the pollWorkflowTasks pattern (sortedReviewTasks.shift()).
@@ -3634,6 +3665,15 @@ export class DispatchDaemonImpl implements DispatchDaemon {
         }
 
         const task = unassigned[0];
+
+        // Re-check: another concurrent operation (Director, CLI) may have
+        // assigned this task between the api.ready() snapshot and now.
+        const freshTask = await this.api.get<Task>(task.id as unknown as ElementId);
+        if (freshTask?.assignee) {
+          logger.debug(`[persistent-worker-dispatch] Task ${task.id} was assigned concurrently, skipping`);
+          unassigned.shift(); // Remove from snapshot so next worker doesn't try again
+          continue;
+        }
 
         try {
           await this.dispatchService.dispatch(task.id, workerId, {
