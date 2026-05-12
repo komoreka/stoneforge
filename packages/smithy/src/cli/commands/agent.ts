@@ -950,6 +950,55 @@ async function agentStartHandler(
       spawnMode = options.mode as 'headless' | 'interactive';
     }
 
+    // Resolve effective spawn mode using the same rule as
+    // SpawnerServiceImpl.determineSpawnMode: director → interactive,
+    // worker/steward → headless, unless explicitly overridden.
+    const effectiveMode: 'headless' | 'interactive' =
+      spawnMode ?? (agentRole === 'director' ? 'interactive' : 'headless');
+
+    if (effectiveMode === 'headless' && !options.prompt && !options.resume) {
+      return failure(
+        [
+          `Cannot start a headless ${agentRole} without an initial prompt.`,
+          `Headless agents read input via stdin; without --prompt or --resume the process exits immediately.`,
+          ``,
+          `Provide one of:`,
+          `  --prompt "..."           Initial instructions for the agent`,
+          `  --resume <session-id>    Resume a previous session`,
+          `  --mode interactive       Start as an interactive (PTY) session`,
+          ``,
+          `Note: in dispatch-driven workflows, the daemon spawns workers automatically when tasks are ready.`,
+          `Manual restart of ephemeral workers is usually unnecessary.`,
+        ].join('\n'),
+        ExitCode.VALIDATION
+      );
+    }
+
+    // Resolve model with the same precedence as session-manager.resolveModel:
+    //   1. explicit --model flag
+    //   2. agent metadata.model (per-agent override)
+    //   3. workspace defaultModels[providerName] (server-side settings)
+    //   4. undefined → provider/SDK built-in default
+    // Without this, manual `sf agent start` calls bypass workspace defaults
+    // even though daemon-driven dispatches honor them.
+    const providerName = (meta as { provider?: string }).provider ?? 'claude-code';
+    const agentModelMeta = (meta as { model?: string }).model;
+    let resolvedModel: string | undefined = options.model ?? agentModelMeta;
+    if (!resolvedModel && stoneforgeDir) {
+      try {
+        const { createStorage, initializeSchema } = await import('@stoneforge/quarry');
+        const { createSettingsService } = await import('../../services/settings-service.js');
+        const dbPath = options.db ?? `${stoneforgeDir}/stoneforge.db`;
+        const backend = createStorage({ path: dbPath, create: false });
+        initializeSchema(backend);
+        const settingsService = createSettingsService(backend);
+        const defaults = settingsService.getAgentDefaults();
+        resolvedModel = defaults.defaultModels?.[providerName];
+      } catch {
+        // Settings unavailable — fall through to provider built-in default
+      }
+    }
+
     // Spawn the agent
     const result = await spawner.spawn(id as EntityId, agentRole, {
       initialPrompt: options.prompt,
@@ -958,6 +1007,7 @@ async function agentStartHandler(
       workingDirectory: options.workdir,
       cols: options.cols ? parseInt(options.cols, 10) : undefined,
       rows: options.rows ? parseInt(options.rows, 10) : undefined,
+      model: resolvedModel,
     });
 
     // If task ID is provided, assign the task to this agent
@@ -1040,6 +1090,8 @@ Options:
   --stream                 Stream agent output after starting
   --provider <name>        Override agent provider for this session
   --model <model>          Override model for this session
+
+For headless workers/stewards (default), one of --prompt, --resume, or --mode interactive is required.
 
 Examples:
   sf agent start el-abc123
