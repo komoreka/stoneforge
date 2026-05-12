@@ -847,15 +847,13 @@ export class TaskAssignmentServiceImpl implements TaskAssignmentService {
       orchestratorMeta: getOrchestratorTaskMeta(task.metadata as Record<string, unknown> | undefined),
     }));
 
-    // Apply agent filter
+    // Apply agent filter — use root task.assignee only.
+    // orchestratorMeta.assignedAgent is historical audit data and diverges from
+    // task.assignee when sf task assign is used (quarry-layer direct update that
+    // doesn't propagate to orchestrator metadata). Reading both with an OR would
+    // make a task appear in two workers' queues simultaneously after reassignment.
     if (filter?.agentId !== undefined) {
-      assignments = assignments.filter((a) => {
-        // Check both task.assignee and orchestrator metadata
-        return (
-          a.task.assignee === filter.agentId ||
-          a.orchestratorMeta?.assignedAgent === filter.agentId
-        );
-      });
+      assignments = assignments.filter((a) => a.task.assignee === filter.agentId);
     }
 
     // Apply assignment status filter
@@ -917,9 +915,8 @@ export class TaskAssignmentServiceImpl implements TaskAssignmentService {
       return 'completed';
     }
 
-    // Check if unassigned (only for tasks not in terminal states)
-    const hasAssignment = task.assignee || orchestratorMeta?.assignedAgent;
-    if (!hasAssignment) {
+    // Check if unassigned — canonical field only (see getAgentTasks filter comment).
+    if (!task.assignee) {
       return 'unassigned';
     }
 
