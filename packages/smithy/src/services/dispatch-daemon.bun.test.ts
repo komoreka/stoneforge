@@ -693,6 +693,98 @@ describe('recoverOrphanedAssignments', () => {
 
     expect(result.processed).toBe(0);
   });
+
+  test('recovers persistent worker with assigned task and no prior session', async () => {
+    // Persistent workers are excluded from pollWorkerAvailability (they don't
+    // auto-claim from the unassigned queue), so without orphan recovery picking
+    // them up, a director-assigned task would sit forever waiting for a session.
+    const worker = await agentRegistry.registerWorker({
+      name: 'persistent-grace',
+      workerMode: 'persistent',
+      createdBy: systemEntity,
+      maxConcurrentTasks: 1,
+    });
+    const workerId = worker.id as unknown as EntityId;
+
+    // No previousSessionId — fresh assignment by the director.
+    await createAssignedTask('Newly assigned task', workerId, {
+      worktree: '/worktrees/persistent-grace/task',
+      branch: 'agent/persistent-grace/task-branch',
+    });
+
+    const result = await daemon.recoverOrphanedAssignments();
+
+    expect(result.pollType).toBe('orphan-recovery');
+    expect(result.processed).toBe(1);
+    expect(result.errors).toBe(0);
+
+    // Falls through to fresh spawn since no providerSessionId in metadata.
+    expect(sessionManager.startSession).toHaveBeenCalledWith(
+      workerId,
+      expect.objectContaining({
+        worktree: '/worktrees/persistent-grace/task',
+      })
+    );
+    expect(sessionManager.resumeSession).not.toHaveBeenCalled();
+  });
+
+  test('recovers highest-priority task first when multiple are assigned', async () => {
+    const { createTask: createTaskFn } = await import('@stoneforge/core');
+
+    const worker = await createTestWorker('priority-grace');
+    const workerId = worker.id as unknown as EntityId;
+
+    // Create P3 (low) task FIRST — naive creation-order selection would pick this
+    const lowPriorityTaskData = await createTaskFn({
+      title: 'Low priority task',
+      createdBy: systemEntity,
+      status: TaskStatus.OPEN,
+      priority: Priority.LOW,
+      assignee: workerId,
+    });
+    const savedLow = await api.create(lowPriorityTaskData as unknown as Record<string, unknown> & { createdBy: EntityId }) as Task;
+    await api.update(savedLow.id, {
+      metadata: updateOrchestratorTaskMeta(undefined, {
+        assignedAgent: workerId,
+        branch: 'agent/priority-grace/low-task-branch',
+        worktree: '/worktrees/priority-grace/low-task',
+      }),
+    });
+
+    // Create P1 (critical) task SECOND
+    const highPriorityTaskData = await createTaskFn({
+      title: 'High priority task',
+      createdBy: systemEntity,
+      status: TaskStatus.OPEN,
+      priority: Priority.CRITICAL,
+      assignee: workerId,
+    });
+    const savedHigh = await api.create(highPriorityTaskData as unknown as Record<string, unknown> & { createdBy: EntityId }) as Task;
+    await api.update(savedHigh.id, {
+      metadata: updateOrchestratorTaskMeta(undefined, {
+        assignedAgent: workerId,
+        branch: 'agent/priority-grace/high-task-branch',
+        worktree: '/worktrees/priority-grace/high-task',
+      }),
+    });
+
+    const result = await daemon.recoverOrphanedAssignments();
+
+    expect(result.processed).toBe(1);
+    // Must have spawned a session in the HIGH priority task's worktree, not the low one
+    expect(sessionManager.startSession).toHaveBeenCalledWith(
+      workerId,
+      expect.objectContaining({
+        workingDirectory: '/worktrees/priority-grace/high-task',
+      })
+    );
+    expect(sessionManager.startSession).not.toHaveBeenCalledWith(
+      workerId,
+      expect.objectContaining({
+        workingDirectory: '/worktrees/priority-grace/low-task',
+      })
+    );
+  });
 });
 
 describe('pollWorkflowTasks - merge steward dispatch', () => {
@@ -1458,6 +1550,177 @@ describe('pollInboxes - duplicate message prevention', () => {
         fs.unlinkSync(testDbPath);
       }
     }
+  });
+});
+
+// ============================================================================
+// pollInboxes - persistent worker messageSession delivery failure
+// ============================================================================
+
+describe('pollInboxes - persistent worker message delivery failure', () => {
+  // Regression test for: processPersistentAgentMessage marked inbox items as read
+  // unconditionally, even when sessionManager.messageSession() returned {success:false}.
+  // Messages sent to workers with degraded PTY sessions (buffer full, long-running session)
+  // were silently dropped. Fix: leave the item unread on failure so it retries next cycle.
+
+  let api: QuarryAPI;
+  let inboxService: InboxService;
+  let agentRegistry: AgentRegistry;
+  let taskAssignment: TaskAssignmentService;
+  let dispatchService: DispatchService;
+  let sessionManager: SessionManager;
+  let worktreeManager: WorktreeManager;
+  let stewardScheduler: StewardScheduler;
+  let daemon: DispatchDaemon;
+  let testDbPath: string;
+  let systemEntity: EntityId;
+
+  beforeEach(async () => {
+    testDbPath = `/tmp/dispatch-daemon-delivery-failure-${Date.now()}-${Math.random().toString(36).slice(2)}.db`;
+    const storage = createStorage({ path: testDbPath, create: true });
+    initializeSchema(storage);
+
+    api = createQuarryAPI(storage);
+    inboxService = createInboxService(storage);
+    agentRegistry = createAgentRegistry(api);
+    taskAssignment = createTaskAssignmentService(api);
+    dispatchService = createDispatchService(api, taskAssignment, agentRegistry);
+    // messageSession returns success by default; individual tests override this
+    sessionManager = createMockSessionManager();
+    worktreeManager = createMockWorktreeManager();
+    stewardScheduler = createMockStewardScheduler();
+
+    const { createEntity, EntityTypeValue } = await import('@stoneforge/core');
+    const entity = await createEntity({
+      name: 'test-system-delivery-failure',
+      entityType: EntityTypeValue.SYSTEM,
+      createdBy: 'system:test' as EntityId,
+    });
+    const saved = await api.create(entity as unknown as Record<string, unknown> & { createdBy: EntityId });
+    systemEntity = saved.id as unknown as EntityId;
+
+    daemon = createDispatchDaemon(
+      api,
+      agentRegistry,
+      sessionManager,
+      dispatchService,
+      worktreeManager,
+      taskAssignment,
+      stewardScheduler,
+      inboxService,
+      {
+        ensureTargetBranchExists: mockEnsureTargetBranchExists,
+        pollIntervalMs: 5000,
+        workerAvailabilityPollEnabled: false,
+        inboxPollEnabled: true,
+        stewardTriggerPollEnabled: false,
+        workflowTaskPollEnabled: false,
+      }
+    );
+  });
+
+  afterEach(async () => {
+    await daemon.stop();
+    if (fs.existsSync(testDbPath)) {
+      fs.unlinkSync(testDbPath);
+    }
+  });
+
+  async function createPersistentWorkerWithSession(name: string): Promise<{ workerId: EntityId; channelId: import('@stoneforge/core').ChannelId }> {
+    const { createGroupChannel } = await import('@stoneforge/core');
+    const worker = await agentRegistry.registerWorker({
+      name,
+      workerMode: 'persistent',
+      createdBy: systemEntity,
+      maxConcurrentTasks: 1,
+    });
+    const workerId = worker.id as unknown as EntityId;
+
+    // Create a channel for this worker so getAgentMetadata returns a channelId
+    const channel = await createGroupChannel({
+      name: `chan-${name}`,
+      createdBy: systemEntity,
+      members: [systemEntity, workerId],
+    });
+    const savedChannel = await api.create(channel as unknown as Record<string, unknown> & { createdBy: EntityId });
+    const channelId = savedChannel.id as unknown as import('@stoneforge/core').ChannelId;
+    await agentRegistry.updateAgentMetadata(workerId, { channelId } as never);
+
+    // Inject a running session into the mock session manager
+    const sessionRecord: SessionRecord = {
+      id: `session-${name}-${Date.now()}`,
+      agentId: workerId,
+      agentRole: 'worker',
+      workerMode: 'persistent',
+      status: 'running',
+      createdAt: createTimestamp(),
+      startedAt: createTimestamp(),
+      lastActivityAt: createTimestamp(),
+    };
+    (sessionManager.getActiveSession as ReturnType<typeof mock>).mockImplementation((id: EntityId) =>
+      id === workerId ? sessionRecord : null
+    );
+
+    return { workerId, channelId };
+  }
+
+  async function addInboxItem(workerId: EntityId, channelId: import('@stoneforge/core').ChannelId): Promise<void> {
+    const { createDocument, createMessage, ContentType: CT, InboxSourceType: IST } = await import('@stoneforge/core');
+    const doc = await createDocument({
+      title: `msg-${Date.now()}`,
+      content: 'Task assignment message',
+      contentType: CT.TEXT,
+      createdBy: systemEntity,
+    });
+    const savedDoc = await api.create(doc as unknown as Record<string, unknown> & { createdBy: EntityId });
+
+    const msg = await createMessage({
+      channelId,
+      sender: systemEntity,
+      contentRef: savedDoc.id as unknown as import('@stoneforge/core').DocumentId,
+    });
+    const savedMsg = await api.create(msg as unknown as Record<string, unknown> & { createdBy: EntityId });
+
+    inboxService.addToInbox({
+      recipientId: workerId,
+      messageId: savedMsg.id as unknown as import('@stoneforge/core').MessageId,
+      channelId,
+      sourceType: IST.DIRECT,
+      createdBy: systemEntity,
+    });
+  }
+
+  test('leaves inbox item unread when messageSession returns success:false', async () => {
+    const { workerId, channelId } = await createPersistentWorkerWithSession('broken-pty-worker');
+    await addInboxItem(workerId, channelId);
+
+    // Simulate PTY write failure
+    (sessionManager.messageSession as ReturnType<typeof mock>).mockImplementation(async () => ({
+      success: false,
+      error: 'PTY write failed: EPIPE',
+    }));
+
+    await daemon.pollInboxes();
+
+    // Item must still be unread — the daemon must not consume messages it failed to deliver
+    const unread = inboxService.getInbox(workerId, { status: 'unread' as unknown as import('@stoneforge/core').InboxStatus });
+    expect(unread.length).toBe(1);
+  });
+
+  test('marks inbox item as read when messageSession succeeds', async () => {
+    const { workerId, channelId } = await createPersistentWorkerWithSession('healthy-pty-worker');
+    await addInboxItem(workerId, channelId);
+
+    // Default mock returns success:true
+    (sessionManager.messageSession as ReturnType<typeof mock>).mockImplementation(async () => ({
+      success: true,
+    }));
+
+    await daemon.pollInboxes();
+
+    // Item must be read — delivery succeeded
+    const unread = inboxService.getInbox(workerId, { status: 'unread' as unknown as import('@stoneforge/core').InboxStatus });
+    expect(unread.length).toBe(0);
   });
 });
 
@@ -6173,6 +6436,459 @@ describe('assignTaskToWorker - missing agent channel resilience', () => {
 });
 
 // ============================================================================
+// Persistent Worker Orphan Recovery + Prompt Selection
+// ============================================================================
+
+describe('recoverOrphanedAssignments - persistent worker support', () => {
+  let api: QuarryAPI;
+  let inboxService: InboxService;
+  let agentRegistry: AgentRegistry;
+  let taskAssignment: TaskAssignmentService;
+  let dispatchService: DispatchService;
+  let sessionManager: SessionManager;
+  let worktreeManager: WorktreeManager;
+  let stewardScheduler: StewardScheduler;
+  let daemon: DispatchDaemon;
+  let testDbPath: string;
+  let systemEntity: EntityId;
+
+  beforeEach(async () => {
+    testDbPath = `/tmp/dispatch-daemon-persistent-test-${Date.now()}-${Math.random().toString(36).slice(2)}.db`;
+    const storage = createStorage({ path: testDbPath, create: true });
+    initializeSchema(storage);
+
+    api = createQuarryAPI(storage);
+    inboxService = createInboxService(storage);
+    agentRegistry = createAgentRegistry(api);
+    taskAssignment = createTaskAssignmentService(api);
+    dispatchService = createDispatchService(api, taskAssignment, agentRegistry);
+    sessionManager = createMockSessionManager();
+    worktreeManager = createMockWorktreeManager();
+    stewardScheduler = createMockStewardScheduler();
+
+    const { createEntity, EntityTypeValue } = await import('@stoneforge/core');
+    const entity = await createEntity({
+      name: 'test-system',
+      entityType: EntityTypeValue.SYSTEM,
+      createdBy: 'system:test' as EntityId,
+    });
+    const saved = await api.create(entity as unknown as Record<string, unknown> & { createdBy: EntityId });
+    systemEntity = saved.id as unknown as EntityId;
+
+    daemon = createDispatchDaemon(
+      api, agentRegistry, sessionManager, dispatchService,
+      worktreeManager, taskAssignment, stewardScheduler, inboxService,
+      { ensureTargetBranchExists: mockEnsureTargetBranchExists, pollIntervalMs: 100,
+        workerAvailabilityPollEnabled: false, inboxPollEnabled: false,
+        stewardTriggerPollEnabled: false, workflowTaskPollEnabled: false }
+    );
+  });
+
+  afterEach(async () => {
+    await daemon.stop();
+    if (fs.existsSync(testDbPath)) fs.unlinkSync(testDbPath);
+  });
+
+  test('recovers persistent worker with assigned task and no prior session', async () => {
+    const worker = await agentRegistry.registerWorker({
+      name: 'PersistentWorker',
+      workerMode: 'persistent',
+      createdBy: systemEntity,
+      maxConcurrentTasks: 1,
+    });
+
+    const task = await createTask({ title: 'Task for persistent worker', createdBy: systemEntity, status: TaskStatus.OPEN, assignee: worker.id as unknown as EntityId });
+    await api.create(task as unknown as Record<string, unknown> & { createdBy: EntityId });
+
+    const result = await daemon.recoverOrphanedAssignments();
+
+    expect(result.processed).toBe(1);
+    expect(sessionManager.startSession).toHaveBeenCalledWith(
+      worker.id,
+      expect.objectContaining({ workingDirectory: expect.any(String) })
+    );
+  });
+
+  test('spawns persistent worker with persistent-worker prompt not ephemeral prompt', async () => {
+    const worker = await agentRegistry.registerWorker({
+      name: 'PersistentWorker',
+      workerMode: 'persistent',
+      createdBy: systemEntity,
+      maxConcurrentTasks: 1,
+    });
+
+    const task = await createTask({ title: 'Task for persistent worker', createdBy: systemEntity, status: TaskStatus.OPEN, assignee: worker.id as unknown as EntityId });
+    await api.create(task as unknown as Record<string, unknown> & { createdBy: EntityId });
+
+    await daemon.recoverOrphanedAssignments();
+
+    const startSessionCalls = (sessionManager.startSession as ReturnType<typeof mock>).mock.calls;
+    const workerCall = startSessionCalls.find((c: unknown[]) => (c[0] as string) === (worker.id as unknown as string));
+    const options = workerCall?.[1] as StartSessionOptions | undefined;
+
+    expect(options?.initialPrompt).toContain('Persistent Worker');
+    expect(options?.initialPrompt).not.toContain('Ephemeral Worker');
+  });
+});
+
+// ============================================================================
+// recoverOrphanedAssignments — Director orphan recovery (Phase 0)
+// ============================================================================
+
+describe('recoverOrphanedAssignments - director orphan recovery', () => {
+  let api: QuarryAPI;
+  let inboxService: InboxService;
+  let agentRegistry: AgentRegistry;
+  let taskAssignment: TaskAssignmentService;
+  let dispatchService: DispatchService;
+  let sessionManager: ReturnType<typeof createMockSessionManager>;
+  let worktreeManager: WorktreeManager;
+  let stewardScheduler: StewardScheduler;
+  let daemon: DispatchDaemon;
+  let testDbPath: string;
+  let systemEntity: EntityId;
+
+  beforeEach(async () => {
+    testDbPath = `/tmp/dispatch-daemon-director-recovery-test-${Date.now()}-${Math.random().toString(36).slice(2)}.db`;
+    const storage = createStorage({ path: testDbPath, create: true });
+    initializeSchema(storage);
+
+    api = createQuarryAPI(storage);
+    inboxService = createInboxService(storage);
+    agentRegistry = createAgentRegistry(api);
+    taskAssignment = createTaskAssignmentService(api);
+    dispatchService = createDispatchService(api, taskAssignment, agentRegistry);
+    sessionManager = createMockSessionManager();
+    worktreeManager = createMockWorktreeManager();
+    stewardScheduler = createMockStewardScheduler();
+
+    const { createEntity, EntityTypeValue } = await import('@stoneforge/core');
+    const entity = await createEntity({
+      name: 'test-system',
+      entityType: EntityTypeValue.SYSTEM,
+      createdBy: 'system:test' as EntityId,
+    });
+    const saved = await api.create(entity as unknown as Record<string, unknown> & { createdBy: EntityId });
+    systemEntity = saved.id as unknown as EntityId;
+
+    daemon = createDispatchDaemon(
+      api,
+      agentRegistry,
+      sessionManager as unknown as SessionManager,
+      dispatchService,
+      worktreeManager,
+      taskAssignment,
+      stewardScheduler,
+      inboxService,
+      { pollIntervalMs: 5000 }
+    );
+  });
+
+  afterEach(async () => {
+    await daemon.stop();
+    if (fs.existsSync(testDbPath)) fs.unlinkSync(testDbPath);
+  });
+
+  test('respawns director when session has terminated', async () => {
+    const director = await agentRegistry.registerDirector({
+      name: 'TestDirector',
+      createdBy: systemEntity,
+    });
+    const directorId = director.id as unknown as EntityId;
+
+    const result = await daemon.recoverOrphanedAssignments();
+
+    expect(result.processed).toBeGreaterThanOrEqual(1);
+    expect(sessionManager.startSession).toHaveBeenCalledWith(
+      directorId,
+      expect.objectContaining({ workingDirectory: expect.any(String) })
+    );
+  });
+
+  test('does not respawn director when session is active', async () => {
+    const director = await agentRegistry.registerDirector({
+      name: 'ActiveDirector',
+      createdBy: systemEntity,
+    });
+    const directorId = director.id as unknown as EntityId;
+
+    await sessionManager.startSession(directorId, { workingDirectory: '/tmp' });
+    const callsBefore = (sessionManager.startSession as ReturnType<typeof mock>).mock.calls.length;
+
+    await daemon.recoverOrphanedAssignments();
+
+    const callsAfter = (sessionManager.startSession as ReturnType<typeof mock>).mock.calls.length;
+    expect(callsAfter).toBe(callsBefore);
+  });
+
+  test('initial prompt contains director role framing and director ID', async () => {
+    const director = await agentRegistry.registerDirector({
+      name: 'PromptCheckDirector',
+      createdBy: systemEntity,
+    });
+    const directorId = director.id as unknown as EntityId;
+
+    await daemon.recoverOrphanedAssignments();
+
+    const calls = (sessionManager.startSession as ReturnType<typeof mock>).mock.calls;
+    const call = calls.find((c: unknown[]) => c[0] === directorId);
+    const options = call?.[1] as StartSessionOptions | undefined;
+
+    expect(options?.initialPrompt).toContain('Director ID');
+    expect(options?.initialPrompt).toContain(directorId);
+  });
+});
+
+// ============================================================================
+// Idle Persistent Worker Session Reaping
+// ============================================================================
+
+describe('reapIdlePersistentWorkerSessions', () => {
+  let api: QuarryAPI;
+  let inboxService: InboxService;
+  let agentRegistry: AgentRegistry;
+  let taskAssignment: TaskAssignmentService;
+  let dispatchService: DispatchService;
+  let sessionManager: SessionManager;
+  let worktreeManager: WorktreeManager;
+  let stewardScheduler: StewardScheduler;
+  let daemon: DispatchDaemon;
+  let testDbPath: string;
+  let systemEntity: EntityId;
+
+  beforeEach(async () => {
+    testDbPath = `/tmp/dispatch-daemon-idle-reap-test-${Date.now()}-${Math.random().toString(36).slice(2)}.db`;
+    const storage = createStorage({ path: testDbPath, create: true });
+    initializeSchema(storage);
+
+    api = createQuarryAPI(storage);
+    inboxService = createInboxService(storage);
+    agentRegistry = createAgentRegistry(api);
+    taskAssignment = createTaskAssignmentService(api);
+    dispatchService = createDispatchService(api, taskAssignment, agentRegistry);
+    sessionManager = createMockSessionManager();
+    worktreeManager = createMockWorktreeManager();
+    stewardScheduler = createMockStewardScheduler();
+
+    const { createEntity, EntityTypeValue } = await import('@stoneforge/core');
+    const entity = await createEntity({
+      name: 'test-system',
+      entityType: EntityTypeValue.SYSTEM,
+      createdBy: 'system:test' as EntityId,
+    });
+    const saved = await api.create(entity as unknown as Record<string, unknown> & { createdBy: EntityId });
+    systemEntity = saved.id as unknown as EntityId;
+  });
+
+  afterEach(async () => {
+    await daemon.stop();
+    if (fs.existsSync(testDbPath)) fs.unlinkSync(testDbPath);
+  });
+
+  test('stops idle persistent worker session that has an assigned task', async () => {
+    daemon = createDispatchDaemon(
+      api, agentRegistry, sessionManager, dispatchService,
+      worktreeManager, taskAssignment, stewardScheduler, inboxService,
+      {
+        ensureTargetBranchExists: mockEnsureTargetBranchExists,
+        pollIntervalMs: 100,
+        workerAvailabilityPollEnabled: false, inboxPollEnabled: false,
+        stewardTriggerPollEnabled: false, workflowTaskPollEnabled: false,
+        orphanRecoveryEnabled: false,
+        idleWorkerSessionThresholdMs: 50,
+      }
+    );
+
+    const worker = await agentRegistry.registerWorker({
+      name: 'IdleDelivery',
+      workerMode: 'persistent',
+      createdBy: systemEntity,
+      maxConcurrentTasks: 1,
+    });
+    const workerId = worker.id as unknown as EntityId;
+
+    // Create and assign a task
+    const task = await createTask({ title: 'Idle task', createdBy: systemEntity, status: TaskStatus.OPEN, assignee: workerId });
+    await api.create(task as unknown as Record<string, unknown> & { createdBy: EntityId });
+
+    // Fake an active session with stale lastActivityAt (100ms ago, threshold is 50ms)
+    const staleTimestamp = new Date(Date.now() - 100).toISOString();
+    const fakeSession = {
+      id: 'session-idle-001',
+      agentId: workerId,
+      agentRole: 'worker' as const,
+      workerMode: 'persistent' as const,
+      mode: 'interactive' as const,
+      status: 'running' as const,
+      workingDirectory: '/tmp',
+      createdAt: staleTimestamp,
+      lastActivityAt: staleTimestamp,
+    };
+    (sessionManager.getActiveSession as ReturnType<typeof mock>).mockImplementation((id: EntityId) =>
+      id === workerId ? fakeSession : undefined
+    );
+
+    await (daemon as DispatchDaemonImpl).reapIdlePersistentWorkerSessions();
+
+    expect(sessionManager.stopSession).toHaveBeenCalledWith(
+      'session-idle-001',
+      expect.objectContaining({ graceful: false })
+    );
+  });
+
+  test('does not stop session when worker has no pending work', async () => {
+    daemon = createDispatchDaemon(
+      api, agentRegistry, sessionManager, dispatchService,
+      worktreeManager, taskAssignment, stewardScheduler, inboxService,
+      {
+        ensureTargetBranchExists: mockEnsureTargetBranchExists,
+        pollIntervalMs: 100,
+        workerAvailabilityPollEnabled: false, inboxPollEnabled: false,
+        stewardTriggerPollEnabled: false, workflowTaskPollEnabled: false,
+        orphanRecoveryEnabled: false,
+        idleWorkerSessionThresholdMs: 50,
+      }
+    );
+
+    const worker = await agentRegistry.registerWorker({
+      name: 'IdleEmpty',
+      workerMode: 'persistent',
+      createdBy: systemEntity,
+      maxConcurrentTasks: 1,
+    });
+    const workerId = worker.id as unknown as EntityId;
+
+    // No tasks assigned, no inbox messages
+    const staleTimestamp = new Date(Date.now() - 100).toISOString();
+    const fakeSession = {
+      id: 'session-idle-002',
+      agentId: workerId,
+      agentRole: 'worker' as const,
+      workerMode: 'persistent' as const,
+      mode: 'interactive' as const,
+      status: 'running' as const,
+      workingDirectory: '/tmp',
+      createdAt: staleTimestamp,
+      lastActivityAt: staleTimestamp,
+    };
+    (sessionManager.getActiveSession as ReturnType<typeof mock>).mockImplementation((id: EntityId) =>
+      id === workerId ? fakeSession : undefined
+    );
+
+    await (daemon as DispatchDaemonImpl).reapIdlePersistentWorkerSessions();
+
+    expect(sessionManager.stopSession).not.toHaveBeenCalled();
+  });
+
+  test('does not stop session that is within the idle threshold', async () => {
+    daemon = createDispatchDaemon(
+      api, agentRegistry, sessionManager, dispatchService,
+      worktreeManager, taskAssignment, stewardScheduler, inboxService,
+      {
+        ensureTargetBranchExists: mockEnsureTargetBranchExists,
+        pollIntervalMs: 100,
+        workerAvailabilityPollEnabled: false, inboxPollEnabled: false,
+        stewardTriggerPollEnabled: false, workflowTaskPollEnabled: false,
+        orphanRecoveryEnabled: false,
+        idleWorkerSessionThresholdMs: 5000, // 5 seconds threshold
+      }
+    );
+
+    const worker = await agentRegistry.registerWorker({
+      name: 'RecentlyActive',
+      workerMode: 'persistent',
+      createdBy: systemEntity,
+      maxConcurrentTasks: 1,
+    });
+    const workerId = worker.id as unknown as EntityId;
+
+    const task = await createTask({ title: 'Active task', createdBy: systemEntity, status: TaskStatus.OPEN, assignee: workerId });
+    await api.create(task as unknown as Record<string, unknown> & { createdBy: EntityId });
+
+    // Session was active 100ms ago — well within 5s threshold
+    const recentTimestamp = new Date(Date.now() - 100).toISOString();
+    const fakeSession = {
+      id: 'session-active-001',
+      agentId: workerId,
+      agentRole: 'worker' as const,
+      workerMode: 'persistent' as const,
+      mode: 'interactive' as const,
+      status: 'running' as const,
+      workingDirectory: '/tmp',
+      createdAt: recentTimestamp,
+      lastActivityAt: recentTimestamp,
+    };
+    (sessionManager.getActiveSession as ReturnType<typeof mock>).mockImplementation((id: EntityId) =>
+      id === workerId ? fakeSession : undefined
+    );
+
+    await (daemon as DispatchDaemonImpl).reapIdlePersistentWorkerSessions();
+
+    expect(sessionManager.stopSession).not.toHaveBeenCalled();
+  });
+
+  test('reap followed by tick triggers orphan recovery respawn', async () => {
+    daemon = createDispatchDaemon(
+      api, agentRegistry, sessionManager, dispatchService,
+      worktreeManager, taskAssignment, stewardScheduler, inboxService,
+      {
+        ensureTargetBranchExists: mockEnsureTargetBranchExists,
+        pollIntervalMs: 100,
+        workerAvailabilityPollEnabled: false, inboxPollEnabled: false,
+        stewardTriggerPollEnabled: false, workflowTaskPollEnabled: false,
+        idleWorkerSessionThresholdMs: 50,
+      }
+    );
+
+    const worker = await agentRegistry.registerWorker({
+      name: 'RespawnMe',
+      workerMode: 'persistent',
+      createdBy: systemEntity,
+      maxConcurrentTasks: 1,
+    });
+    const workerId = worker.id as unknown as EntityId;
+
+    const task = await createTask({ title: 'Respawn task', createdBy: systemEntity, status: TaskStatus.OPEN, assignee: workerId });
+    await api.create(task as unknown as Record<string, unknown> & { createdBy: EntityId });
+
+    // First getActiveSession call returns stale session (triggers reap).
+    // After stopSession, getActiveSession returns undefined (session is dead).
+    // This makes the worker eligible for orphan recovery respawn.
+    const staleTimestamp = new Date(Date.now() - 100).toISOString();
+    const fakeSession = {
+      id: 'session-respawn-001',
+      agentId: workerId,
+      agentRole: 'worker' as const,
+      workerMode: 'persistent' as const,
+      mode: 'interactive' as const,
+      status: 'running' as const,
+      workingDirectory: '/tmp',
+      createdAt: staleTimestamp,
+      lastActivityAt: staleTimestamp,
+    };
+    let sessionAlive = true;
+    (sessionManager.getActiveSession as ReturnType<typeof mock>).mockImplementation((id: EntityId) => {
+      if (id !== workerId) return undefined;
+      return sessionAlive ? fakeSession : undefined;
+    });
+    (sessionManager.stopSession as ReturnType<typeof mock>).mockImplementation(async () => {
+      sessionAlive = false;
+    });
+
+    await daemon.tick();
+
+    expect(sessionManager.stopSession).toHaveBeenCalledWith(
+      'session-respawn-001',
+      expect.objectContaining({ graceful: false })
+    );
+    expect(sessionManager.startSession).toHaveBeenCalledWith(
+      workerId,
+      expect.objectContaining({ workingDirectory: expect.any(String) })
+    );
+  });
+});
+
+// ============================================================================
 // Per-Director Target Branch Propagation
 // ============================================================================
 
@@ -6434,5 +7150,604 @@ describe('assignTaskToWorker - per-director targetBranch propagation', () => {
       expect(assignedIds).toContain(enabledWorker.id as unknown as string);
       expect(assignedIds).not.toContain(disabledWorker.id as unknown as string);
     });
+  });
+});
+
+// ============================================================================
+// getDispatchHealth harness + tests
+// ============================================================================
+
+interface DaemonHarness {
+  api: QuarryAPI;
+  registry: AgentRegistry;
+  daemon: DispatchDaemon;
+  systemEntity: EntityId;
+  dispose(): Promise<void>;
+}
+
+async function setupDaemonHarness(opts?: { configOverrides?: Partial<DispatchDaemonConfig> }): Promise<DaemonHarness> {
+  const dbPath = `/tmp/dispatch-health-test-${Date.now()}-${Math.random().toString(36).slice(2)}.db`;
+  const storage = createStorage({ path: dbPath, create: true });
+  initializeSchema(storage);
+
+  const api = createQuarryAPI(storage);
+  const inboxService = createInboxService(storage);
+  const registry = createAgentRegistry(api);
+  const taskAssignment = createTaskAssignmentService(api);
+  const dispatchService = createDispatchService(api, taskAssignment, registry);
+  const sessionManager = createMockSessionManager();
+  const worktreeManager = createMockWorktreeManager();
+  const stewardScheduler = createMockStewardScheduler();
+
+  const { createEntity, EntityTypeValue } = await import('@stoneforge/core');
+  const systemRaw = await createEntity({
+    name: 'health-test-system',
+    entityType: EntityTypeValue.SYSTEM,
+    createdBy: 'system:test' as EntityId,
+  });
+  const saved = await api.create(systemRaw as unknown as Record<string, unknown> & { createdBy: EntityId });
+  const systemEntity = saved.id as unknown as EntityId;
+
+  const config: DispatchDaemonConfig = {
+    ensureTargetBranchExists: mockEnsureTargetBranchExists,
+    pollIntervalMs: 100,
+    workerAvailabilityPollEnabled: false,
+    inboxPollEnabled: false,
+    stewardTriggerPollEnabled: false,
+    workflowTaskPollEnabled: false,
+    ...opts?.configOverrides,
+  };
+
+  const daemon = createDispatchDaemon(
+    api,
+    registry,
+    sessionManager,
+    dispatchService,
+    worktreeManager,
+    taskAssignment,
+    stewardScheduler,
+    inboxService,
+    config
+  );
+
+  return {
+    api,
+    registry,
+    daemon,
+    systemEntity,
+    async dispose() {
+      await daemon.stop();
+      if (fs.existsSync(dbPath)) {
+        fs.unlinkSync(dbPath);
+      }
+    },
+  };
+}
+
+describe('getDispatchHealth', () => {
+  test('reports stuck=false when there are no ready tasks', async () => {
+    const harness = await setupDaemonHarness();
+    try {
+      const health = await harness.daemon.getDispatchHealth();
+      expect(health.readyUnassignedTasks).toBe(0);
+      expect(health.availableWorkers).toBe(0);
+      expect(health.stuck).toBe(false);
+      expect(typeof health.computedAt).toBe('string');
+    } finally {
+      await harness.dispose();
+    }
+  });
+
+  test('reports stuck=true when ready unassigned tasks exist and no workers are registered', async () => {
+    const harness = await setupDaemonHarness();
+    try {
+      const task = await createTask({
+        title: 'do the thing',
+        createdBy: harness.systemEntity,
+        status: TaskStatus.OPEN,
+      });
+      await harness.api.create(task as unknown as Record<string, unknown> & { createdBy: EntityId });
+      const health = await harness.daemon.getDispatchHealth();
+      expect(health.readyUnassignedTasks).toBe(1);
+      expect(health.availableWorkers).toBe(0);
+      expect(health.stuck).toBe(true);
+    } finally {
+      await harness.dispose();
+    }
+  });
+
+  test('reports stuck=false when ready unassigned tasks have at least one available worker', async () => {
+    const harness = await setupDaemonHarness();
+    try {
+      const task = await createTask({
+        title: 'do the thing',
+        createdBy: harness.systemEntity,
+        status: TaskStatus.OPEN,
+      });
+      await harness.api.create(task as unknown as Record<string, unknown> & { createdBy: EntityId });
+      await harness.registry.registerWorker({
+        name: 'w1',
+        workerMode: 'ephemeral',
+        createdBy: harness.systemEntity,
+      });
+      const health = await harness.daemon.getDispatchHealth();
+      expect(health.readyUnassignedTasks).toBe(1);
+      expect(health.availableWorkers).toBe(1);
+      expect(health.stuck).toBe(false);
+    } finally {
+      await harness.dispose();
+    }
+  });
+
+  test('treats disabled workers as unavailable for stuck-queue detection', async () => {
+    const harness = await setupDaemonHarness();
+    try {
+      const task = await createTask({
+        title: 'do the thing',
+        createdBy: harness.systemEntity,
+        status: TaskStatus.OPEN,
+      });
+      await harness.api.create(task as unknown as Record<string, unknown> & { createdBy: EntityId });
+      const w = await harness.registry.registerWorker({
+        name: 'w1',
+        workerMode: 'ephemeral',
+        createdBy: harness.systemEntity,
+      });
+      await harness.registry.updateAgentMetadata(w.id, { disabled: true });
+      const health = await harness.daemon.getDispatchHealth();
+      expect(health.availableWorkers).toBe(0);
+      expect(health.stuck).toBe(true);
+    } finally {
+      await harness.dispose();
+    }
+  });
+});
+
+describe('stuck-queue transition logging', () => {
+  test('emits a STUCK warn on the healthy → stuck transition, then stays silent on subsequent ticks', async () => {
+    const warnSpy = mock((..._args: unknown[]) => {});
+    const infoSpy = mock((..._args: unknown[]) => {});
+    const harness = await setupDaemonHarness({
+      configOverrides: { logger: { warn: warnSpy, info: infoSpy } },
+    });
+    try {
+      const task = await createTask({
+        title: 'x',
+        createdBy: harness.systemEntity,
+        status: TaskStatus.OPEN,
+      });
+      await harness.api.create(task as unknown as Record<string, unknown> & { createdBy: EntityId });
+      // No workers registered; queue is stuck.
+      await harness.daemon.tick();
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      const message = warnSpy.mock.calls[0][0] as string;
+      expect(message).toContain('STUCK');
+      expect(message).toContain('1 task(s) ready');
+      expect(message).toContain('no available workers');
+
+      // Subsequent stuck ticks must NOT spam the log (transition-only model).
+      await harness.daemon.tick();
+      await harness.daemon.tick();
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      await harness.dispose();
+    }
+  });
+
+  test('emits a RESUMED info on the stuck → healthy transition', async () => {
+    const warnSpy = mock((..._args: unknown[]) => {});
+    const infoSpy = mock((..._args: unknown[]) => {});
+    const harness = await setupDaemonHarness({
+      configOverrides: { logger: { warn: warnSpy, info: infoSpy } },
+    });
+    try {
+      const task = await createTask({
+        title: 'x',
+        createdBy: harness.systemEntity,
+        status: TaskStatus.OPEN,
+      });
+      await harness.api.create(task as unknown as Record<string, unknown> & { createdBy: EntityId });
+      // First tick: queue is stuck (no workers). Triggers STUCK warn.
+      await harness.daemon.tick();
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+
+      // Register a worker; on next tick the queue is healthy. Triggers RESUMED info.
+      await harness.registry.registerWorker({ name: 'w1', workerMode: 'ephemeral', createdBy: harness.systemEntity, maxConcurrentTasks: 1 });
+      await harness.daemon.tick();
+      expect(infoSpy).toHaveBeenCalledTimes(1);
+      const infoMessage = infoSpy.mock.calls[0][0] as string;
+      expect(infoMessage).toContain('RESUMED');
+    } finally {
+      await harness.dispose();
+    }
+  });
+});
+
+// ============================================================================
+// getDispatchHealth — pollStale detection
+// ============================================================================
+
+describe('getDispatchHealth - pollStale detection', () => {
+  test('reports lastPollCompletedAt fresh and pollStale=false right after a successful poll cycle', async () => {
+    const harness = await setupDaemonHarness();
+    try {
+      await harness.daemon.tick();
+      const health = await harness.daemon.getDispatchHealth();
+      expect(health.lastPollCompletedAt).toBeDefined();
+      expect(health.lastPollStartedAt).toBeDefined();
+      expect(health.pollStale).toBe(false);
+      // lastPollCompletedAt should be within the last second
+      const ageMs = Date.now() - new Date(health.lastPollCompletedAt!).getTime();
+      expect(ageMs).toBeLessThan(1000);
+    } finally {
+      await harness.dispose();
+    }
+  });
+
+  test('reports pollStale=false and undefined timestamps when daemon has never polled', async () => {
+    const harness = await setupDaemonHarness();
+    try {
+      // Don't call tick() — daemon is constructed but never polled.
+      const health = await harness.daemon.getDispatchHealth();
+      expect(health.lastPollStartedAt).toBeUndefined();
+      expect(health.lastPollCompletedAt).toBeUndefined();
+      // pollStale must be false when there's no baseline — we don't know if
+      // the daemon has had a chance to poll yet, so we must not false-alarm.
+      expect(health.pollStale).toBe(false);
+    } finally {
+      await harness.dispose();
+    }
+  });
+
+  test('reports pollStale=true when a poll cycle is wedged past the threshold', async () => {
+    // Simulate a wedged cycle: stub api.ready (called by both pollWorkerAvailability
+    // and getDispatchHealth itself) to return a never-resolving promise on the
+    // first invocation only. Start tick() without awaiting, sleep past the
+    // (very short) threshold, then probe health via a second api.ready call
+    // that resolves normally.
+    const harness = await setupDaemonHarness({
+      configOverrides: {
+        // Override threshold to a tiny value so the test runs fast.
+        pollStaleThresholdMs: 50,
+        // Enable the worker-availability poll so api.ready actually gets called.
+        workerAvailabilityPollEnabled: true,
+      },
+    });
+    try {
+      // Wedge the first runPollCycle by making api.ready hang on the first call.
+      // Subsequent calls (e.g. from getDispatchHealth) must resolve quickly.
+      const realReady = harness.api.ready.bind(harness.api);
+      let callCount = 0;
+      const neverResolves = new Promise<never>(() => { /* never */ });
+      const stubbedApi = harness.api as { ready: typeof harness.api.ready };
+      stubbedApi.ready = ((filter?: Parameters<typeof realReady>[0]) => {
+        callCount += 1;
+        if (callCount === 1) return neverResolves;
+        return realReady(filter);
+      }) as typeof harness.api.ready;
+
+      // Start tick() but don't await — the cycle wedges inside.
+      const wedgedTick = harness.daemon.tick();
+      void wedgedTick; // prevent unused-var lint
+
+      // Wait past the threshold (50ms) plus a margin. lastPollStartedAt was set
+      // at the top of runPollCycle, lastPollCompletedAt was NOT set because
+      // the finally block hasn't been reached yet.
+      await new Promise(r => setTimeout(r, 150));
+
+      const health = await harness.daemon.getDispatchHealth();
+      expect(health.pollStale).toBe(true);
+      expect(health.lastPollStartedAt).toBeDefined();
+      expect(health.lastPollCompletedAt).toBeUndefined();
+    } finally {
+      await harness.dispose();
+    }
+  });
+
+  test('honors a custom pollStaleThresholdMs from config', async () => {
+    // Default threshold is max(60_000, 10 × pollIntervalMs). With a custom
+    // override, a freshly-completed poll reports pollStale=false, but if we
+    // artificially push lastPollCompletedAt back past the override, pollStale
+    // flips true.
+    const harness = await setupDaemonHarness({
+      configOverrides: { pollStaleThresholdMs: 10 },
+    });
+    try {
+      await harness.daemon.tick();
+      // Right after tick: not stale.
+      let health = await harness.daemon.getDispatchHealth();
+      expect(health.pollStale).toBe(false);
+
+      // Force BOTH timestamps back 100ms (well past the 10ms threshold). In a
+      // real wedge both move together; pushing only one would simulate
+      // "cycle in flight" and trigger the in-flight branch instead of the
+      // completed-but-stale branch we want to exercise here.
+      // Cast through unknown to access private fields — acceptable for tests.
+      const daemon = harness.daemon as unknown as {
+        lastPollStartedAt: string;
+        lastPollCompletedAt: string;
+      };
+      const past = new Date(Date.now() - 100).toISOString();
+      daemon.lastPollStartedAt = past;
+      daemon.lastPollCompletedAt = past;
+
+      health = await harness.daemon.getDispatchHealth();
+      expect(health.pollStale).toBe(true);
+    } finally {
+      await harness.dispose();
+    }
+  });
+});
+
+// ============================================================================
+// ensurePersistentWorkerSessions
+// ============================================================================
+
+describe('ensurePersistentWorkerSessions', () => {
+  let api: QuarryAPI;
+  let inboxService: InboxService;
+  let agentRegistry: AgentRegistry;
+  let taskAssignment: TaskAssignmentService;
+  let dispatchService: DispatchService;
+  let sessionManager: SessionManager;
+  let worktreeManager: WorktreeManager;
+  let stewardScheduler: StewardScheduler;
+  let daemon: DispatchDaemon;
+  let testDbPath: string;
+  let systemEntity: EntityId;
+
+  beforeEach(async () => {
+    testDbPath = `/tmp/dispatch-daemon-ensure-sessions-test-${Date.now()}-${Math.random().toString(36).slice(2)}.db`;
+    const storage = createStorage({ path: testDbPath, create: true });
+    initializeSchema(storage);
+
+    api = createQuarryAPI(storage);
+    inboxService = createInboxService(storage);
+    agentRegistry = createAgentRegistry(api);
+    taskAssignment = createTaskAssignmentService(api);
+    dispatchService = createDispatchService(api, taskAssignment, agentRegistry);
+    sessionManager = createMockSessionManager();
+    worktreeManager = createMockWorktreeManager();
+    stewardScheduler = createMockStewardScheduler();
+
+    const { createEntity, EntityTypeValue } = await import('@stoneforge/core');
+    const entity = await createEntity({
+      name: 'test-system',
+      entityType: EntityTypeValue.SYSTEM,
+      createdBy: 'system:test' as EntityId,
+    });
+    const saved = await api.create(entity as unknown as Record<string, unknown> & { createdBy: EntityId });
+    systemEntity = saved.id as unknown as EntityId;
+
+    daemon = createDispatchDaemon(
+      api, agentRegistry, sessionManager, dispatchService,
+      worktreeManager, taskAssignment, stewardScheduler, inboxService,
+      {
+        ensureTargetBranchExists: mockEnsureTargetBranchExists,
+        pollIntervalMs: 100,
+        orphanRecoveryEnabled: false,
+        workerAvailabilityPollEnabled: false,
+        inboxPollEnabled: false,
+        stewardTriggerPollEnabled: false,
+        workflowTaskPollEnabled: false,
+      }
+    );
+  });
+
+  afterEach(async () => {
+    await daemon.stop();
+    if (fs.existsSync(testDbPath)) fs.unlinkSync(testDbPath);
+  });
+
+  test('spawns standby session for persistent worker with no active session', async () => {
+    await agentRegistry.registerWorker({
+      name: 'StandbyWorker',
+      workerMode: 'persistent',
+      createdBy: systemEntity,
+      maxConcurrentTasks: 1,
+    });
+
+    await daemon.ensurePersistentWorkerSessions();
+
+    expect(sessionManager.startSession).toHaveBeenCalledTimes(1);
+    expect(sessionManager.startSession).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({ workingDirectory: expect.any(String), initialPrompt: expect.any(String) })
+    );
+  });
+
+  test('does not spawn session for persistent worker that already has one', async () => {
+    const worker = await agentRegistry.registerWorker({
+      name: 'ActiveWorker',
+      workerMode: 'persistent',
+      createdBy: systemEntity,
+      maxConcurrentTasks: 1,
+    });
+
+    (sessionManager.getActiveSession as ReturnType<typeof mock>).mockReturnValue({
+      id: 'existing-session',
+      agentId: worker.id,
+      status: 'running',
+      mode: 'interactive',
+      createdAt: new Date().toISOString(),
+      lastActivityAt: new Date().toISOString(),
+    });
+
+    await daemon.ensurePersistentWorkerSessions();
+
+    expect(sessionManager.startSession).not.toHaveBeenCalled();
+  });
+
+  test('does not spawn session for disabled persistent worker', async () => {
+    const worker = await agentRegistry.registerWorker({
+      name: 'DisabledWorker',
+      workerMode: 'persistent',
+      createdBy: systemEntity,
+      maxConcurrentTasks: 1,
+    });
+    await agentRegistry.updateAgentMetadata(worker.id as unknown as EntityId, { disabled: true } as never);
+
+    await daemon.ensurePersistentWorkerSessions();
+
+    expect(sessionManager.startSession).not.toHaveBeenCalled();
+  });
+
+  test('does not spawn session for ephemeral worker', async () => {
+    await agentRegistry.registerWorker({
+      name: 'EphemeralWorker',
+      workerMode: 'ephemeral',
+      createdBy: systemEntity,
+      maxConcurrentTasks: 1,
+    });
+
+    await daemon.ensurePersistentWorkerSessions();
+
+    expect(sessionManager.startSession).not.toHaveBeenCalled();
+  });
+});
+
+// ============================================================================
+// pollPersistentWorkerDispatch
+// ============================================================================
+
+describe('pollPersistentWorkerDispatch', () => {
+  let api: QuarryAPI;
+  let inboxService: InboxService;
+  let agentRegistry: AgentRegistry;
+  let taskAssignment: TaskAssignmentService;
+  let dispatchService: DispatchService;
+  let sessionManager: SessionManager;
+  let worktreeManager: WorktreeManager;
+  let stewardScheduler: StewardScheduler;
+  let daemon: DispatchDaemon;
+  let testDbPath: string;
+  let systemEntity: EntityId;
+
+  beforeEach(async () => {
+    testDbPath = `/tmp/dispatch-daemon-pw-dispatch-test-${Date.now()}-${Math.random().toString(36).slice(2)}.db`;
+    const storage = createStorage({ path: testDbPath, create: true });
+    initializeSchema(storage);
+
+    api = createQuarryAPI(storage);
+    inboxService = createInboxService(storage);
+    agentRegistry = createAgentRegistry(api);
+    taskAssignment = createTaskAssignmentService(api);
+    dispatchService = createDispatchService(api, taskAssignment, agentRegistry);
+    sessionManager = createMockSessionManager();
+    worktreeManager = createMockWorktreeManager();
+    stewardScheduler = createMockStewardScheduler();
+
+    const { createEntity, EntityTypeValue } = await import('@stoneforge/core');
+    const entity = await createEntity({
+      name: 'test-system',
+      entityType: EntityTypeValue.SYSTEM,
+      createdBy: 'system:test' as EntityId,
+    });
+    const saved = await api.create(entity as unknown as Record<string, unknown> & { createdBy: EntityId });
+    systemEntity = saved.id as unknown as EntityId;
+
+    daemon = createDispatchDaemon(
+      api, agentRegistry, sessionManager, dispatchService,
+      worktreeManager, taskAssignment, stewardScheduler, inboxService,
+      {
+        ensureTargetBranchExists: mockEnsureTargetBranchExists,
+        pollIntervalMs: 100,
+        orphanRecoveryEnabled: false,
+        persistentWorkerSessionEnsureEnabled: false,
+        workerAvailabilityPollEnabled: false,
+        inboxPollEnabled: false,
+        stewardTriggerPollEnabled: false,
+        workflowTaskPollEnabled: false,
+      }
+    );
+  });
+
+  afterEach(async () => {
+    await daemon.stop();
+    if (fs.existsSync(testDbPath)) fs.unlinkSync(testDbPath);
+  });
+
+  test('dispatches unassigned task to idle persistent worker', async () => {
+    const worker = await agentRegistry.registerWorker({
+      name: 'PersistentDispatchWorker',
+      workerMode: 'persistent',
+      createdBy: systemEntity,
+      maxConcurrentTasks: 1,
+    });
+    const task = await createTask({
+      title: 'Task to auto-dispatch',
+      createdBy: systemEntity,
+      status: TaskStatus.OPEN,
+    });
+    await api.create(task as unknown as Record<string, unknown> & { createdBy: EntityId });
+
+    const result = await daemon.pollPersistentWorkerDispatch();
+
+    expect(result.processed).toBe(1);
+    const assigned = await api.get<import('@stoneforge/core').Task>(task.id as unknown as import('@stoneforge/core').ElementId);
+    expect(assigned?.assignee).toBe(worker.id);
+  });
+
+  test('skips persistent worker that already has an in_progress task', async () => {
+    const worker = await agentRegistry.registerWorker({
+      name: 'BusyWorker',
+      workerMode: 'persistent',
+      createdBy: systemEntity,
+      maxConcurrentTasks: 1,
+    });
+    // Create and assign an in_progress task to the worker
+    const existingTask = await createTask({
+      title: 'Already in progress',
+      createdBy: systemEntity,
+      status: TaskStatus.IN_PROGRESS,
+      assignee: worker.id as unknown as EntityId,
+    });
+    await api.create(existingTask as unknown as Record<string, unknown> & { createdBy: EntityId });
+
+    const newTask = await createTask({
+      title: 'Would-be dispatched',
+      createdBy: systemEntity,
+      status: TaskStatus.OPEN,
+    });
+    await api.create(newTask as unknown as Record<string, unknown> & { createdBy: EntityId });
+
+    const result = await daemon.pollPersistentWorkerDispatch();
+
+    expect(result.processed).toBe(0);
+    const notAssigned = await api.get<import('@stoneforge/core').Task>(newTask.id as unknown as import('@stoneforge/core').ElementId);
+    expect(notAssigned?.assignee).toBeUndefined();
+  });
+
+  test('skips ephemeral workers', async () => {
+    await agentRegistry.registerWorker({
+      name: 'EphemeralWorker',
+      workerMode: 'ephemeral',
+      createdBy: systemEntity,
+      maxConcurrentTasks: 1,
+    });
+    const task = await createTask({
+      title: 'Unassigned task',
+      createdBy: systemEntity,
+      status: TaskStatus.OPEN,
+    });
+    await api.create(task as unknown as Record<string, unknown> & { createdBy: EntityId });
+
+    const result = await daemon.pollPersistentWorkerDispatch();
+
+    expect(result.processed).toBe(0);
+  });
+
+  test('does not dispatch when no unassigned tasks exist', async () => {
+    await agentRegistry.registerWorker({
+      name: 'IdleWorker',
+      workerMode: 'persistent',
+      createdBy: systemEntity,
+      maxConcurrentTasks: 1,
+    });
+    // No tasks created
+
+    const result = await daemon.pollPersistentWorkerDispatch();
+
+    expect(result.processed).toBe(0);
   });
 });
