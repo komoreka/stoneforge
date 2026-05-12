@@ -3558,12 +3558,13 @@ export class DispatchDaemonImpl implements DispatchDaemon {
     // Include sync status section if sync was attempted
     if (syncResult) {
       parts.push('', '## Sync Status', '');
-      parts.push('The branch was synced with master before your review.', '');
+      const syncTargetBranch = getValue('merge.targetBranch') as string | null | undefined ?? 'master';
+      parts.push(`The branch was synced with ${syncTargetBranch} before your review.`, '');
 
       if (syncResult.success) {
         parts.push('**Result**: SUCCESS');
         parts.push('');
-        parts.push('Branch is up-to-date with master. `git diff origin/master..HEAD` will show only this task\'s changes.');
+        parts.push(`Branch is up-to-date with ${syncTargetBranch}. \`git diff origin/${syncTargetBranch}..HEAD\` will show only this task's changes.`);
       } else if (syncResult.conflicts && syncResult.conflicts.length > 0) {
         parts.push('**Result**: CONFLICTS');
         parts.push('');
@@ -4592,8 +4593,13 @@ export class DispatchDaemonImpl implements DispatchDaemon {
       };
     }
 
-    // Get default branch
-    const defaultBranch = await this.worktreeManager.getDefaultBranch();
+    // Resolve the target branch using the same priority order as task dispatch:
+    // task metadata → workspace config → git detection.
+    // Previously this called worktreeManager.getDefaultBranch() which only does
+    // git detection and always resolves to master, ignoring merge.targetBranch.
+    const targetBranchFromMeta = orchestratorMeta?.targetBranch as string | undefined;
+    const configuredTargetBranch = getValue('merge.targetBranch') as string | null | undefined;
+    const defaultBranch = targetBranchFromMeta ?? configuredTargetBranch ?? await this.worktreeManager.getDefaultBranch();
     const remoteBranch = `origin/${defaultBranch}`;
 
     // Attempt to merge
