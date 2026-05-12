@@ -65,6 +65,7 @@ import {
 import { createSyncEngine, createConfiguredProviderRegistry } from '@stoneforge/quarry';
 import { attachSessionEventSaver } from './routes/sessions.js';
 import { notifySSEClientsOfNewSession } from './routes/events.js';
+import { notifyClientsOfNewSession } from './websocket.js';
 import { DB_PATH as DEFAULT_DB_PATH, PROJECT_ROOT as DEFAULT_PROJECT_ROOT, getClaudePath } from './config.js';
 import { getDaemonConfigOverrides } from './daemon-state.js';
 import { createLogger } from '../utils/logger.js';
@@ -308,6 +309,10 @@ export async function initializeServices(options: ServicesOptions = {}): Promise
         agentRole: session.agentRole || 'worker',
         events,
       });
+
+      // Notify WebSocket clients (XTerminal for persistent workers and directors)
+      // so they reconnect to the new session's PTY event stream.
+      notifyClientsOfNewSession(agentId as EntityId, session, events);
 
       // Store initial prompt for SSE clients
       sessionInitialPrompts.set(session.id, initialPrompt);
