@@ -19,6 +19,28 @@ import { TaskStatus, createTimestamp } from '@stoneforge/core';
 // ============================================================================
 
 /**
+ * Loads the workspace-level `merge.targetBranch` from `.stoneforge/config.yaml`,
+ * if set. Returns `undefined` if config is missing, `merge` is unset, or the
+ * value is null/empty.
+ *
+ * This is the second-priority fallback when resolving an effective target
+ * branch for merge operations: task metadata wins, then this config value,
+ * then git origin/HEAD detection, then the hardcoded `main` default.
+ *
+ * Exported so callers (and tests) can reuse the same precedence rule.
+ */
+export async function loadConfigTargetBranch(): Promise<string | undefined> {
+  try {
+    const { loadConfig } = await import('@stoneforge/quarry');
+    const config = loadConfig();
+    const value = (config.merge as { targetBranch?: string | null } | undefined)?.targetBranch;
+    return typeof value === 'string' && value.length > 0 ? value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Creates task assignment service
  */
 async function createTaskAssignmentService(options: GlobalOptions): Promise<{
@@ -103,6 +125,7 @@ interface TaskHandoffOptions {
   branch?: string;
   worktree?: string;
   sessionId?: string;
+  to?: string;
 }
 
 const taskHandoffOptions: CommandOption[] = [
@@ -130,6 +153,12 @@ const taskHandoffOptions: CommandOption[] = [
     description: 'Session ID of the agent handing off (defaults to current session)',
     hasValue: true,
   },
+  {
+    name: 'to',
+    short: 't',
+    description: 'Target agent ID — assign directly to this agent instead of returning to the pool',
+    hasValue: true,
+  },
 ];
 
 async function taskHandoffHandler(
@@ -155,6 +184,7 @@ async function taskHandoffHandler(
       message: options.message,
       branch: options.branch,
       worktree: options.worktree,
+      toAgent: options.to ? options.to as import('@stoneforge/core').EntityId : undefined,
     });
 
     const mode = getOutputMode(options);
@@ -188,7 +218,12 @@ async function taskHandoffHandler(
       lines.push(`  Worktree:  ${options.worktree}`);
     }
     lines.push('');
-    lines.push('Task has been unassigned and is available for pickup by another agent.');
+    if (options.to) {
+      lines.push(`Task assigned to agent ${options.to} — daemon will notify them on the next poll cycle.`);
+    } else {
+      lines.push('Task has been returned to the unassigned pool.');
+      lines.push('Tip: use --to <agent-id> to route directly to a specific agent.');
+    }
 
     return success(task, lines.join('\n'));
   } catch (err) {
@@ -414,7 +449,12 @@ async function taskMergeHandler(
     const { getOrchestratorTaskMeta, updateOrchestratorTaskMeta } = await import('../../types/task-meta.js');
     const orchestratorMeta = getOrchestratorTaskMeta(task.metadata as Record<string, unknown>);
     const sourceBranch = orchestratorMeta?.branch;
-    const targetBranch = orchestratorMeta?.targetBranch;
+    // Resolution: task metadata → workspace config → git detection (in mergeBranch).
+    // Workspace config (`merge.targetBranch` in `.stoneforge/config.yaml`) lets
+    // operators set a project-wide target without per-task or per-director
+    // metadata, which is the only path stewards have today since they cannot
+    // own a `targetBranch` field directly.
+    const targetBranch = orchestratorMeta?.targetBranch ?? await loadConfigTargetBranch();
 
     if (!sourceBranch) {
       return failure(`Task ${taskId} has no branch in orchestrator metadata.`, ExitCode.GENERAL_ERROR);
@@ -457,6 +497,8 @@ async function taskMergeHandler(
     const { exec: execCb } = await import('node:child_process');
     const { promisify: promisifyUtil } = await import('node:util');
     const execVerify = promisifyUtil(execCb);
+    // `targetBranch` already includes the workspace config fallback (see resolution comment above);
+    // detectTargetBranch is the final fallback to git origin/HEAD when neither is set.
     const effectiveTargetForVerify = targetBranch ?? await detectTargetBranch(workspaceRoot);
 
     try {
@@ -536,6 +578,21 @@ async function taskMergeHandler(
     try {
       await execVerify(`git push origin --delete ${sourceBranch}`, { cwd: workspaceRoot });
     } catch { /* branch may not exist on remote */ }
+
+    // Close the GitHub PR with an explanation. The local squash+push means GitHub
+    // won't auto-detect the merge (squash commits don't match the PR branch),
+    // so we explicitly close it with a note. Using gh pr close avoids an extra
+    // merge commit; a future improvement is to switch to gh pr merge --squash.
+    const prUrl = orchestratorMeta?.mergeRequestUrl;
+    if (prUrl) {
+      try {
+        const commitNote = mergeResult.commitHash ? ` Squash commit: ${mergeResult.commitHash}.` : '';
+        await execVerify(
+          `gh pr close "${prUrl}" --comment "Squash-merged to ${targetBranch} via \`sf task merge\`.${commitNote}"`,
+          { cwd: workspaceRoot }
+        );
+      } catch { /* gh not available or PR already closed — not fatal */ }
+    }
 
     const worktreePath = orchestratorMeta?.worktree;
     if (worktreePath) {
@@ -864,9 +921,10 @@ async function taskSyncHandler(
       return failure(syncResult.message, ExitCode.GENERAL_ERROR);
     }
 
-    // Use the task's targetBranch if set, otherwise fall back to default branch
-    const targetBranch = orchestratorMeta?.targetBranch as string | undefined;
-    const syncBranch = targetBranch ?? await worktreeManager.getDefaultBranch();
+    // Use the task's targetBranch if set, then workspace config `merge.targetBranch`,
+    // otherwise fall back to the worktree's default branch.
+    const taskTargetBranch = orchestratorMeta?.targetBranch as string | undefined;
+    const syncBranch = taskTargetBranch ?? await loadConfigTargetBranch() ?? await worktreeManager.getDefaultBranch();
     const remoteBranch = `origin/${syncBranch}`;
 
     // Attempt to merge
@@ -1162,9 +1220,11 @@ async function taskMergeStatusHandler(
             } catch { /* no remote */ }
 
             if (hasRemote) {
-              // Determine effective target branch
+              // Determine effective target branch:
+              // task metadata → workspace config → git origin/HEAD → "main"
               const { detectTargetBranch } = await import('../../git/merge.js');
-              const effectiveTarget = targetBranch ?? await detectTargetBranch(workspaceRoot);
+              const configTarget = await loadConfigTargetBranch();
+              const effectiveTarget = targetBranch ?? configTarget ?? await detectTargetBranch(workspaceRoot);
               const mergeCommitHash = orchestratorMeta?.mergeCommitHash;
 
               const result = await verifyMergeStatus({
