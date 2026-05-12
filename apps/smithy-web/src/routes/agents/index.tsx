@@ -7,7 +7,7 @@
 
 import { useState, useMemo, useEffect } from 'react';
 import { useSearch, useNavigate } from '@tanstack/react-router';
-import { Users, Plus, Search, Crown, Wrench, Shield, Loader2, AlertCircle, RefreshCw, Network, Layers } from 'lucide-react';
+import { Users, Plus, Search, Crown, Wrench, Shield, Loader2, AlertCircle, RefreshCw, Network, Layers, LayoutDashboard } from 'lucide-react';
 import { getCurrentBinding, formatKeyBinding } from '../../lib/keyboard';
 import { useAgentsByRole, useStartAgentSession, useStopAgentSession, useDeleteAgent, useDirectors, useSessions } from '../../api/hooks/useAgents';
 import { useTasks } from '../../api/hooks/useTasks';
@@ -16,10 +16,11 @@ import type { AgentPool } from '../../api/hooks/usePools';
 import { AgentCard, CreateAgentDialog, DeleteAgentDialog, RenameAgentDialog, StartAgentDialog } from '../../components/agent';
 import { PoolCard, CreatePoolDialog, EditPoolDialog } from '../../components/pool';
 import { AgentWorkspaceGraph } from '../../components/agent-graph';
+import { AgentBoardView } from '../../components/agent-board';
 import type { Agent, SessionStatus, AgentRole, StewardFocus } from '../../api/types';
 import { DispatchHealthBanner } from '../../components/dispatch/DispatchHealthBanner';
 
-type TabValue = 'agents' | 'stewards' | 'pools' | 'graph';
+type TabValue = 'agents' | 'stewards' | 'pools' | 'graph' | 'board';
 
 export function AgentsPage() {
   const search = useSearch({ from: '/agents' }) as { tab?: string; selected?: string; role?: string; action?: string };
@@ -427,6 +428,20 @@ export function AgentsPage() {
               Graph
             </span>
           </button>
+          <button
+            onClick={() => setTab('board')}
+            className={`pb-3 px-4 text-sm font-medium border-b-2 transition-colors ${
+              currentTab === 'board'
+                ? 'text-[var(--color-primary)] border-[var(--color-primary)]'
+                : 'text-[var(--color-text-secondary)] hover:text-[var(--color-text)] border-transparent hover:border-[var(--color-border)]'
+            }`}
+            data-testid="agents-tab-board"
+          >
+            <span className="flex items-center gap-2">
+              <LayoutDashboard className="w-4 h-4" />
+              Board
+            </span>
+          </button>
         </nav>
       </div>
 
@@ -448,6 +463,18 @@ export function AgentsPage() {
             onRefresh={refetch}
           />
         </div>
+      ) : currentTab === 'board' ? (
+        // Board tab handles its own loading/error states
+        <AgentBoardView
+          directors={directorAgents}
+          workers={workers}
+          tasks={tasks}
+          sessionStatuses={sessionStatuses}
+          isLoading={isLoading}
+          error={error}
+          onRefresh={refetch}
+          onOpenTerminal={handleOpenTerminal}
+        />
       ) : isLoading ? (
         <div className="flex flex-col items-center justify-center py-16">
           <Loader2 className="w-8 h-8 text-[var(--color-primary)] animate-spin mb-4" />
