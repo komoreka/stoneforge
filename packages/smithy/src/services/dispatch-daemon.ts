@@ -700,6 +700,13 @@ export class DispatchDaemonImpl implements DispatchDaemon {
    * Items are added before forwarding and removed after markAsRead() completes.
    */
   private readonly forwardingInboxItems = new Set<string>();
+  /**
+   * Per-(worker, task) timestamp of the last "task assigned to you" notification
+   * fired from Pass 1 of pollPersistentWorkerDispatch. Key format: `${workerId}:${taskId}`.
+   * The cooldown prevents the same worker from being re-pinged about the same task
+   * on every poll cycle. Worker-level keys (no task) would suppress notifications
+   * for genuinely-new task assignments after a recent ping for a different task.
+   */
   private readonly lastPreAssignedNotifyAt = new Map<string, number>();
 
   /**
@@ -3607,8 +3614,11 @@ export class DispatchDaemonImpl implements DispatchDaemon {
 
       // Pass 1: Notify workers about pre-assigned OPEN tasks they haven't started.
       // Covers tasks assigned via `sf task assign`, `sf task handoff --to`, or Director
-      // dispatch that bypassed the daemon. Runs every 30s per worker to avoid spamming.
-      const NOTIFY_COOLDOWN_MS = 30_000;
+      // dispatch that bypassed the daemon. Cooldown is per-(worker, task) at 5 minutes:
+      // long enough that a worker won't be spammed about the same task on every poll,
+      // short enough that a stuck task gets a periodic reminder. A per-worker cooldown
+      // would suppress notifications for legitimately-new assignments after a recent ping.
+      const NOTIFY_COOLDOWN_MS = 300_000; // 5 minutes
       for (const worker of workers) {
         if (isAgentDisabled(worker)) continue;
         const workerId = asEntityId(worker.id);
@@ -3620,10 +3630,10 @@ export class DispatchDaemonImpl implements DispatchDaemon {
         });
         if (openTasks.length === 0) continue; // No OPEN tasks assigned
 
-        const lastNotify = this.lastPreAssignedNotifyAt.get(workerId) ?? 0;
-        if (Date.now() - lastNotify < NOTIFY_COOLDOWN_MS) continue; // Cooldown active
-
         const assignment = openTasks[0];
+        const cooldownKey = `${workerId}:${assignment.taskId}`;
+        const lastNotify = this.lastPreAssignedNotifyAt.get(cooldownKey) ?? 0;
+        if (Date.now() - lastNotify < NOTIFY_COOLDOWN_MS) continue; // Same-task cooldown active
 
         // If the canonical assignee (task.assignee) differs from the metadata's
         // assignedAgent, the task was re-routed via sf task assign (quarry) without
@@ -3652,7 +3662,7 @@ export class DispatchDaemonImpl implements DispatchDaemon {
           senderId: workerId,
         });
         if (deliveryResult.success) {
-          this.lastPreAssignedNotifyAt.set(workerId, Date.now());
+          this.lastPreAssignedNotifyAt.set(cooldownKey, Date.now());
           logger.info(`[persistent-worker-dispatch] Notified ${worker.name} about pre-assigned task ${assignment.taskId}`);
         }
       }

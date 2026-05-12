@@ -7858,4 +7858,47 @@ describe('pollPersistentWorkerDispatch', () => {
     expect(meta!.branch).toContain('canonicaldelivery');  // branch derived from new agent name
     expect(meta!.branch).not.toContain('stalereciplentadmin');
   });
+
+  test('Pass 1 suppresses repeat notifications for the same (worker, task) pair within cooldown (Bug 10 self-ping loop)', async () => {
+    // Bug 10: daemon re-fires "Task assigned to you" notification dozens of times to
+    // the same correctly-assigned worker for the same task in a tight loop. Cooldown
+    // must be per-(worker, task), not per-worker, and long enough that consecutive
+    // poll cycles do not all fire notifications for the same OPEN task.
+    const worker = await agentRegistry.registerWorker({
+      name: 'RepeatPingWorker',
+      workerMode: 'persistent',
+      createdBy: systemEntity,
+      maxConcurrentTasks: 1,
+    });
+    const raw = await createTask({
+      title: 'Already-assigned task that worker has not started',
+      createdBy: systemEntity,
+      status: TaskStatus.OPEN,
+      assignee: worker.id as unknown as EntityId,
+    });
+    const saved = await api.create(raw as unknown as Record<string, unknown> & { createdBy: EntityId }) as import('@stoneforge/core').Task;
+
+    // Mark metadata as already in sync so Bug 5 resync path doesn't fire
+    await api.update(saved.id as unknown as import('@stoneforge/core').ElementId, {
+      metadata: updateOrchestratorTaskMeta(undefined, {
+        assignedAgent: worker.id as unknown as EntityId,
+      }),
+    });
+
+    await (sessionManager as ReturnType<typeof createMockSessionManager>).startSession(
+      worker.id as unknown as EntityId
+    );
+
+    const messageSessionMock = sessionManager.messageSession as ReturnType<typeof mock>;
+    messageSessionMock.mockClear();
+
+    // Two back-to-back poll cycles. The first must notify; the second must NOT
+    // re-notify (same-task cooldown still active).
+    await daemon.pollPersistentWorkerDispatch();
+    await daemon.pollPersistentWorkerDispatch();
+    await daemon.pollPersistentWorkerDispatch();
+
+    // messageSession should be called exactly once across the three polls
+    expect(messageSessionMock.mock.calls.length).toBe(1);
+  });
 });
