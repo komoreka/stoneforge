@@ -304,6 +304,13 @@ export interface DispatchDaemonConfig {
   readonly persistentWorkerSessionEnsureEnabled?: boolean;
 
   /**
+   * When true (default), the daemon will auto-dispatch unassigned ready tasks
+   * to idle persistent workers on each poll cycle.
+   * Default: true
+   */
+  readonly persistentWorkerDispatchEnabled?: boolean;
+
+  /**
    * Callback fired when a session is started by the daemon.
    * Allows the server to attach event savers and save the initial prompt.
    */
@@ -385,7 +392,7 @@ export interface DispatchHealth {
  */
 export interface PollResult {
   /** The poll type */
-  readonly pollType: 'worker-availability' | 'inbox' | 'steward-trigger' | 'workflow-task' | 'orphan-recovery' | 'closed-unmerged-reconciliation' | 'stuck-merge-recovery' | 'plan-auto-complete' | 'workflow-auto-transition';
+  readonly pollType: 'worker-availability' | 'inbox' | 'steward-trigger' | 'workflow-task' | 'orphan-recovery' | 'closed-unmerged-reconciliation' | 'stuck-merge-recovery' | 'plan-auto-complete' | 'workflow-auto-transition' | 'persistent-worker-dispatch';
   /** Timestamp when the poll started */
   readonly startedAt: string;
   /** Duration of the poll in milliseconds */
@@ -421,6 +428,7 @@ interface NormalizedConfig {
   idleWorkerSessionThresholdMs: number;
   idleWorkerSessionReapEnabled: boolean;
   persistentWorkerSessionEnsureEnabled: boolean;
+  persistentWorkerDispatchEnabled: boolean;
   onSessionStarted?: OnSessionStartedCallback;
   projectRoot: string;
   directorInboxForwardingEnabled: boolean;
@@ -511,6 +519,12 @@ export interface DispatchDaemon {
    * no active session, regardless of task status.
    */
   ensurePersistentWorkerSessions(): Promise<void>;
+
+  /**
+   * Polls persistent workers and dispatches unassigned ready tasks to idle ones.
+   * Called automatically each poll cycle when persistentWorkerDispatchEnabled is true.
+   */
+  pollPersistentWorkerDispatch(): Promise<PollResult>;
 
   /**
    * Manually triggers closed-but-unmerged task reconciliation.
@@ -2316,6 +2330,7 @@ export class DispatchDaemonImpl implements DispatchDaemon {
       idleWorkerSessionThresholdMs: config?.idleWorkerSessionThresholdMs ?? 30 * 60 * 1000,
       idleWorkerSessionReapEnabled: config?.idleWorkerSessionReapEnabled ?? true,
       persistentWorkerSessionEnsureEnabled: config?.persistentWorkerSessionEnsureEnabled ?? true,
+      persistentWorkerDispatchEnabled: config?.persistentWorkerDispatchEnabled ?? true,
       onSessionStarted: config?.onSessionStarted,
       projectRoot: config?.projectRoot ?? process.cwd(),
       directorInboxForwardingEnabled: config?.directorInboxForwardingEnabled ?? true,
@@ -2401,6 +2416,10 @@ export class DispatchDaemonImpl implements DispatchDaemon {
       // messages.
       if (this.config.persistentWorkerSessionEnsureEnabled) {
         await this.ensurePersistentWorkerSessions();
+      }
+
+      if (this.config.persistentWorkerDispatchEnabled) {
+        await this.pollPersistentWorkerDispatch();
       }
 
       // Reap stale sessions before polling for availability
@@ -3555,6 +3574,91 @@ export class DispatchDaemonImpl implements DispatchDaemon {
         logger.warn(`[ensure-persistent-sessions] Failed to spawn session for ${worker.name}: ${errorMessage}`);
       }
     }
+  }
+
+  async pollPersistentWorkerDispatch(): Promise<PollResult> {
+    const startedAt = new Date().toISOString();
+    const startTime = Date.now();
+    let processed = 0;
+    let errors = 0;
+    const errorMessages: string[] = [];
+
+    this.emitter.emit('poll:start', 'persistent-worker-dispatch');
+
+    try {
+      const workers = await this.agentRegistry.listAgents({
+        role: 'worker',
+        workerMode: 'persistent',
+      });
+
+      for (const worker of workers) {
+        if (isAgentDisabled(worker)) continue;
+
+        const workerId = asEntityId(worker.id);
+
+        // Skip if worker has active tasks (open or in_progress)
+        const activeTasks = await this.taskAssignment.getAgentTasks(workerId, {
+          taskStatus: [TaskStatus.OPEN, TaskStatus.IN_PROGRESS],
+        });
+        if (activeTasks.length > 0) continue;
+
+        // Skip if worker already has an unread inbox item (dispatch in flight)
+        const unread = this.inboxService.getInbox(workerId, {
+          status: InboxStatus.UNREAD,
+          limit: 1,
+        });
+        if (unread.length > 0) continue;
+
+        // Find unassigned ready tasks
+        const readyTasks = await this.api.ready({ includeEphemeral: true });
+        const unassigned = readyTasks.filter((t) => !t.assignee);
+        if (unassigned.length === 0) break;
+
+        const execCheck = this.resolveExecutableWithFallback(worker);
+        if (execCheck === 'all_limited') {
+          logger.debug(
+            `[persistent-worker-dispatch] All executables rate-limited for ${worker.name}, skipping`
+          );
+          continue;
+        }
+
+        const task = unassigned[0];
+
+        try {
+          await this.dispatchService.dispatch(task.id, workerId, {
+            markAsStarted: false,
+          });
+          this.emitter.emit('task:dispatched', task.id, workerId);
+          logger.info(
+            `[persistent-worker-dispatch] Dispatched task ${task.id} ("${task.title}") to ${worker.name}`
+          );
+          this.operationLog?.write('info', 'dispatch', `Auto-dispatched task ${task.id} to persistent worker ${worker.name}`, { taskId: task.id, agentId: workerId });
+          processed++;
+        } catch (error) {
+          errors++;
+          const errorMessage = error instanceof Error ? error.message : String(error);
+          errorMessages.push(`Worker ${worker.name}: ${errorMessage}`);
+          logger.error(`[persistent-worker-dispatch] Failed to dispatch task ${task.id} to ${worker.name}:`, error);
+        }
+      }
+    } catch (error) {
+      errors++;
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      errorMessages.push(errorMessage);
+      logger.error('Error in pollPersistentWorkerDispatch:', error);
+    }
+
+    const result: PollResult = {
+      pollType: 'persistent-worker-dispatch',
+      startedAt,
+      durationMs: Date.now() - startTime,
+      processed,
+      errors,
+      errorMessages: errorMessages.length > 0 ? errorMessages : undefined,
+    };
+
+    this.emitter.emit('poll:complete', result);
+    return result;
   }
 
   /**
