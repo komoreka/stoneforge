@@ -333,10 +333,11 @@ describe('TaskTypeValue', () => {
     expect(TaskTypeValue.FEATURE).toBe('feature');
     expect(TaskTypeValue.TASK).toBe('task');
     expect(TaskTypeValue.CHORE).toBe('chore');
+    expect(TaskTypeValue.OPS).toBe('ops');
   });
 
-  test('has exactly 4 types', () => {
-    expect(Object.keys(TaskTypeValue)).toHaveLength(4);
+  test('has exactly 5 types', () => {
+    expect(Object.keys(TaskTypeValue)).toHaveLength(5);
   });
 
   test('DEFAULT_TASK_TYPE is TASK', () => {
@@ -350,6 +351,7 @@ describe('isValidTaskType', () => {
     expect(isValidTaskType('feature')).toBe(true);
     expect(isValidTaskType('task')).toBe(true);
     expect(isValidTaskType('chore')).toBe(true);
+    expect(isValidTaskType('ops')).toBe(true);
   });
 
   test('rejects invalid task types', () => {
