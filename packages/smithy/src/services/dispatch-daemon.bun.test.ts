@@ -1382,8 +1382,8 @@ describe('reconcileClosedUnmergedTasks', () => {
     return (await api.get<Task>(saved.id))!;
   }
 
-  test('reconciles a closed task with mergeStatus=pending past the grace period', async () => {
-    const task = await createClosedUnmergedTask('Stuck pending task');
+  test('reconciles a closed task with mergeStatus=testing past the grace period', async () => {
+    const task = await createClosedUnmergedTask('Stuck testing task', { mergeStatus: 'testing' });
 
     const result = await daemon.reconcileClosedUnmergedTasks();
 
@@ -1396,9 +1396,64 @@ describe('reconcileClosedUnmergedTasks', () => {
     expect(updatedTask!.status).toBe(TaskStatus.REVIEW);
   });
 
+  test('reconciles a closed task with mergeStatus=merging past the grace period', async () => {
+    const task = await createClosedUnmergedTask('Stuck merging task', { mergeStatus: 'merging' });
+
+    const result = await daemon.reconcileClosedUnmergedTasks();
+
+    expect(result.processed).toBe(1);
+    const updatedTask = await api.get<Task>(task.id);
+    expect(updatedTask!.status).toBe(TaskStatus.REVIEW);
+  });
+
+  test('does NOT reconcile a closed task with mergeStatus=pending (Bug 8: operator close is intentional)', async () => {
+    // A worker completes a task → mergeStatus becomes 'pending'. If the Director
+    // then closes the task (e.g., after Tester PASS, task superseded, done out-of-band),
+    // that close must be sticky. The reconciliation must not resurrect 'pending' tasks.
+    const task = await createClosedUnmergedTask('Director-closed pending task', { mergeStatus: 'pending' });
+
+    const result = await daemon.reconcileClosedUnmergedTasks();
+
+    expect(result.processed).toBe(0);
+    const updatedTask = await api.get<Task>(task.id);
+    expect(updatedTask!.status).toBe(TaskStatus.CLOSED);
+  });
+
+  test('compound Bug5+Bug8: stale assignedAgent in metadata + pending mergeStatus stays closed after Director close', async () => {
+    // Scenario: task was dispatched to CodeAdmin (sets orchestratorMeta.assignedAgent).
+    // Tester completed, Director closed. reconcileClosedUnmergedTasks must not
+    // resurrect the task and re-dispatch to the stale assignedAgent.
+    const saved = await api.create(
+      (await createTask({ title: 'Compound bug task', createdBy: systemEntity, status: TaskStatus.CLOSED })) as unknown as Record<string, unknown> & { createdBy: EntityId }
+    ) as Task;
+
+    await api.update<Task>(saved.id, {
+      closedAt: new Date(Date.now() - 300_000).toISOString(),
+      closeReason: 'Director closed after Tester PASS',
+      metadata: updateOrchestratorTaskMeta(undefined, {
+        mergeStatus: 'pending' as import('../types/task-meta.js').MergeStatus,
+        branch: 'agent/codeadmin/task-branch',
+        assignedAgent: 'agent-codeadmin-id' as import('@stoneforge/core').EntityId,
+        completedAt: new Date(Date.now() - 600_000).toISOString(),
+      }),
+    });
+
+    const result = await daemon.reconcileClosedUnmergedTasks();
+
+    // Must stay closed — no resurrection, no stale-metadata dispatch
+    expect(result.processed).toBe(0);
+    const updatedTask = await api.get<Task>(saved.id);
+    expect(updatedTask!.status).toBe(TaskStatus.CLOSED);
+    const meta = getOrchestratorTaskMeta(updatedTask!.metadata as Record<string, unknown> | undefined);
+    // assignedAgent metadata is untouched (reconciliation never ran)
+    expect(meta!.assignedAgent).toBe('agent-codeadmin-id');
+  });
+
   test('skips tasks within the grace period (closed recently)', async () => {
-    // Close the task just now (within grace period of 120s)
+    // Close the task just now (within grace period of 120s), use testing to ensure
+    // it would otherwise qualify for reconciliation
     await createClosedUnmergedTask('Recently closed task', {
+      mergeStatus: 'testing',
       closedAt: new Date().toISOString(),
     });
 
@@ -1432,6 +1487,7 @@ describe('reconcileClosedUnmergedTasks', () => {
 
   test('increments reconciliationCount in metadata', async () => {
     const task = await createClosedUnmergedTask('Task to count reconciliation', {
+      mergeStatus: 'testing',
       reconciliationCount: 1,
     });
 
@@ -1444,6 +1500,7 @@ describe('reconcileClosedUnmergedTasks', () => {
 
   test('stops reconciling after 3 attempts (safety valve)', async () => {
     const task = await createClosedUnmergedTask('Task at safety limit', {
+      mergeStatus: 'testing',
       reconciliationCount: 3,
     });
 
@@ -1457,7 +1514,7 @@ describe('reconcileClosedUnmergedTasks', () => {
   });
 
   test('clears closedAt and closeReason on reconciled tasks', async () => {
-    const task = await createClosedUnmergedTask('Task to clear close fields');
+    const task = await createClosedUnmergedTask('Task to clear close fields', { mergeStatus: 'testing' });
 
     await daemon.reconcileClosedUnmergedTasks();
 
@@ -1470,7 +1527,7 @@ describe('reconcileClosedUnmergedTasks', () => {
     // Reconfigure daemon with reconciliation disabled
     daemon.updateConfig({ closedUnmergedReconciliationEnabled: false });
 
-    const task = await createClosedUnmergedTask('Task that should not be reconciled');
+    const task = await createClosedUnmergedTask('Task that should not be reconciled', { mergeStatus: 'testing' });
 
     // The config flag only affects the poll cycle, not direct calls.
     // Verify the config is set correctly.

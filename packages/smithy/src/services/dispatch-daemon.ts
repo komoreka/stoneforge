@@ -1853,14 +1853,20 @@ export class DispatchDaemonImpl implements DispatchDaemon {
     this.emitter.emit('poll:start', 'closed-unmerged-reconciliation');
 
     try {
-      // Find tasks that are CLOSED but were closed while still in an active merge state.
-      // Only reconcile in-flight states ('pending', 'testing', 'merging') — these represent
-      // tasks closed before the merge machinery could finish. Terminal failure states
-      // ('failed', 'conflict', 'test_failed') indicate the steward already gave up; a
-      // subsequent operator close on those tasks is intentional and must not be reversed.
+      // Only reconcile tasks closed while the steward was *actively* merging ('testing',
+      // 'merging'). These represent a genuine mid-merge interruption (daemon restart, race
+      // condition) that warrants a retry.
+      //
+      // Explicitly excluded states:
+      // - 'pending': the steward had not yet started. Any close at this point is an
+      //   operator decision (e.g., Director closes after Tester PASS, or task superseded).
+      //   The compound of Bug 5 (stale assignedAgent) + Bug 8 (pending resurrection)
+      //   causes agents to receive stale dispatches on already-closed work.
+      // - 'failed', 'conflict', 'test_failed': terminal failure states; the steward already
+      //   gave up and an operator close is intentional.
       const stuckTasks = await this.taskAssignment.listAssignments({
         taskStatus: [TaskStatus.CLOSED],
-        mergeStatus: ['pending', 'testing', 'merging'],
+        mergeStatus: ['testing', 'merging'],
       });
 
       const now = Date.now();
