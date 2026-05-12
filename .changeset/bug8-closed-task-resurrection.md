@@ -6,12 +6,14 @@ fix(smithy): prevent closed tasks from resurrecting to open/review
 
 Three independent paths could reverse an operator's explicit task close:
 
-**reconcileClosedUnmergedTasks** — now only reconciles tasks closed while still
-in an active merge state (`pending`, `testing`, `merging`). Terminal failure states
-(`failed`, `conflict`, `test_failed`) are excluded: the merge steward already gave
-up, so a subsequent operator close is intentional and must not be reversed. The
-previous filter included `failed`, causing closed tasks to silently reappear in
-REVIEW after the grace period expired.
+**reconcileClosedUnmergedTasks** — now only reconciles tasks closed while the
+steward was *actively* merging (`testing`, `merging`). All other states are
+excluded: `failed`, `conflict`, `test_failed` indicate the steward gave up;
+`pending` means the steward had not yet started — any operator close at that
+point is intentional. The previous filter included both `failed` and `pending`,
+which combined with stale `orchestratorMeta.assignedAgent` (Bug 5) caused agents
+to receive dispatch notifications for already-closed, already-verified work
+(observed compound failure: el-671g4 pattern).
 
 **handoffTask** — now throws if the task is already closed, matching the existing
 guard on `completeTask`. Previously any worker that held a stale task reference
