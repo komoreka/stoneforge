@@ -6469,6 +6469,255 @@ describe('recoverOrphanedAssignments - director orphan recovery', () => {
 });
 
 // ============================================================================
+// Idle Persistent Worker Session Reaping
+// ============================================================================
+
+describe('reapIdlePersistentWorkerSessions', () => {
+  let api: QuarryAPI;
+  let inboxService: InboxService;
+  let agentRegistry: AgentRegistry;
+  let taskAssignment: TaskAssignmentService;
+  let dispatchService: DispatchService;
+  let sessionManager: SessionManager;
+  let worktreeManager: WorktreeManager;
+  let stewardScheduler: StewardScheduler;
+  let daemon: DispatchDaemon;
+  let testDbPath: string;
+  let systemEntity: EntityId;
+
+  beforeEach(async () => {
+    testDbPath = `/tmp/dispatch-daemon-idle-reap-test-${Date.now()}-${Math.random().toString(36).slice(2)}.db`;
+    const storage = createStorage({ path: testDbPath, create: true });
+    initializeSchema(storage);
+
+    api = createQuarryAPI(storage);
+    inboxService = createInboxService(storage);
+    agentRegistry = createAgentRegistry(api);
+    taskAssignment = createTaskAssignmentService(api);
+    dispatchService = createDispatchService(api, taskAssignment, agentRegistry);
+    sessionManager = createMockSessionManager();
+    worktreeManager = createMockWorktreeManager();
+    stewardScheduler = createMockStewardScheduler();
+
+    const { createEntity, EntityTypeValue } = await import('@stoneforge/core');
+    const entity = await createEntity({
+      name: 'test-system',
+      entityType: EntityTypeValue.SYSTEM,
+      createdBy: 'system:test' as EntityId,
+    });
+    const saved = await api.create(entity as unknown as Record<string, unknown> & { createdBy: EntityId });
+    systemEntity = saved.id as unknown as EntityId;
+  });
+
+  afterEach(async () => {
+    await daemon.stop();
+    if (fs.existsSync(testDbPath)) fs.unlinkSync(testDbPath);
+  });
+
+  test('stops idle persistent worker session that has an assigned task', async () => {
+    daemon = createDispatchDaemon(
+      api, agentRegistry, sessionManager, dispatchService,
+      worktreeManager, taskAssignment, stewardScheduler, inboxService,
+      {
+        ensureTargetBranchExists: mockEnsureTargetBranchExists,
+        pollIntervalMs: 100,
+        workerAvailabilityPollEnabled: false, inboxPollEnabled: false,
+        stewardTriggerPollEnabled: false, workflowTaskPollEnabled: false,
+        orphanRecoveryEnabled: false,
+        idleWorkerSessionThresholdMs: 50,
+      }
+    );
+
+    const worker = await agentRegistry.registerWorker({
+      name: 'IdleDelivery',
+      workerMode: 'persistent',
+      createdBy: systemEntity,
+      maxConcurrentTasks: 1,
+    });
+    const workerId = worker.id as unknown as EntityId;
+
+    // Create and assign a task
+    const task = await createTask({ title: 'Idle task', createdBy: systemEntity, status: TaskStatus.OPEN, assignee: workerId });
+    await api.create(task as unknown as Record<string, unknown> & { createdBy: EntityId });
+
+    // Fake an active session with stale lastActivityAt (100ms ago, threshold is 50ms)
+    const staleTimestamp = new Date(Date.now() - 100).toISOString();
+    const fakeSession = {
+      id: 'session-idle-001',
+      agentId: workerId,
+      agentRole: 'worker' as const,
+      workerMode: 'persistent' as const,
+      mode: 'interactive' as const,
+      status: 'running' as const,
+      workingDirectory: '/tmp',
+      createdAt: staleTimestamp,
+      lastActivityAt: staleTimestamp,
+    };
+    (sessionManager.getActiveSession as ReturnType<typeof mock>).mockImplementation((id: EntityId) =>
+      id === workerId ? fakeSession : undefined
+    );
+
+    await (daemon as DispatchDaemonImpl).reapIdlePersistentWorkerSessions();
+
+    expect(sessionManager.stopSession).toHaveBeenCalledWith(
+      'session-idle-001',
+      expect.objectContaining({ graceful: false })
+    );
+  });
+
+  test('does not stop session when worker has no pending work', async () => {
+    daemon = createDispatchDaemon(
+      api, agentRegistry, sessionManager, dispatchService,
+      worktreeManager, taskAssignment, stewardScheduler, inboxService,
+      {
+        ensureTargetBranchExists: mockEnsureTargetBranchExists,
+        pollIntervalMs: 100,
+        workerAvailabilityPollEnabled: false, inboxPollEnabled: false,
+        stewardTriggerPollEnabled: false, workflowTaskPollEnabled: false,
+        orphanRecoveryEnabled: false,
+        idleWorkerSessionThresholdMs: 50,
+      }
+    );
+
+    const worker = await agentRegistry.registerWorker({
+      name: 'IdleEmpty',
+      workerMode: 'persistent',
+      createdBy: systemEntity,
+      maxConcurrentTasks: 1,
+    });
+    const workerId = worker.id as unknown as EntityId;
+
+    // No tasks assigned, no inbox messages
+    const staleTimestamp = new Date(Date.now() - 100).toISOString();
+    const fakeSession = {
+      id: 'session-idle-002',
+      agentId: workerId,
+      agentRole: 'worker' as const,
+      workerMode: 'persistent' as const,
+      mode: 'interactive' as const,
+      status: 'running' as const,
+      workingDirectory: '/tmp',
+      createdAt: staleTimestamp,
+      lastActivityAt: staleTimestamp,
+    };
+    (sessionManager.getActiveSession as ReturnType<typeof mock>).mockImplementation((id: EntityId) =>
+      id === workerId ? fakeSession : undefined
+    );
+
+    await (daemon as DispatchDaemonImpl).reapIdlePersistentWorkerSessions();
+
+    expect(sessionManager.stopSession).not.toHaveBeenCalled();
+  });
+
+  test('does not stop session that is within the idle threshold', async () => {
+    daemon = createDispatchDaemon(
+      api, agentRegistry, sessionManager, dispatchService,
+      worktreeManager, taskAssignment, stewardScheduler, inboxService,
+      {
+        ensureTargetBranchExists: mockEnsureTargetBranchExists,
+        pollIntervalMs: 100,
+        workerAvailabilityPollEnabled: false, inboxPollEnabled: false,
+        stewardTriggerPollEnabled: false, workflowTaskPollEnabled: false,
+        orphanRecoveryEnabled: false,
+        idleWorkerSessionThresholdMs: 5000, // 5 seconds threshold
+      }
+    );
+
+    const worker = await agentRegistry.registerWorker({
+      name: 'RecentlyActive',
+      workerMode: 'persistent',
+      createdBy: systemEntity,
+      maxConcurrentTasks: 1,
+    });
+    const workerId = worker.id as unknown as EntityId;
+
+    const task = await createTask({ title: 'Active task', createdBy: systemEntity, status: TaskStatus.OPEN, assignee: workerId });
+    await api.create(task as unknown as Record<string, unknown> & { createdBy: EntityId });
+
+    // Session was active 100ms ago — well within 5s threshold
+    const recentTimestamp = new Date(Date.now() - 100).toISOString();
+    const fakeSession = {
+      id: 'session-active-001',
+      agentId: workerId,
+      agentRole: 'worker' as const,
+      workerMode: 'persistent' as const,
+      mode: 'interactive' as const,
+      status: 'running' as const,
+      workingDirectory: '/tmp',
+      createdAt: recentTimestamp,
+      lastActivityAt: recentTimestamp,
+    };
+    (sessionManager.getActiveSession as ReturnType<typeof mock>).mockImplementation((id: EntityId) =>
+      id === workerId ? fakeSession : undefined
+    );
+
+    await (daemon as DispatchDaemonImpl).reapIdlePersistentWorkerSessions();
+
+    expect(sessionManager.stopSession).not.toHaveBeenCalled();
+  });
+
+  test('reap followed by tick triggers orphan recovery respawn', async () => {
+    daemon = createDispatchDaemon(
+      api, agentRegistry, sessionManager, dispatchService,
+      worktreeManager, taskAssignment, stewardScheduler, inboxService,
+      {
+        ensureTargetBranchExists: mockEnsureTargetBranchExists,
+        pollIntervalMs: 100,
+        workerAvailabilityPollEnabled: false, inboxPollEnabled: false,
+        stewardTriggerPollEnabled: false, workflowTaskPollEnabled: false,
+        idleWorkerSessionThresholdMs: 50,
+      }
+    );
+
+    const worker = await agentRegistry.registerWorker({
+      name: 'RespawnMe',
+      workerMode: 'persistent',
+      createdBy: systemEntity,
+      maxConcurrentTasks: 1,
+    });
+    const workerId = worker.id as unknown as EntityId;
+
+    const task = await createTask({ title: 'Respawn task', createdBy: systemEntity, status: TaskStatus.OPEN, assignee: workerId });
+    await api.create(task as unknown as Record<string, unknown> & { createdBy: EntityId });
+
+    // First getActiveSession call returns stale session (triggers reap).
+    // After stopSession, getActiveSession returns undefined (session is dead).
+    // This makes the worker eligible for orphan recovery respawn.
+    const staleTimestamp = new Date(Date.now() - 100).toISOString();
+    const fakeSession = {
+      id: 'session-respawn-001',
+      agentId: workerId,
+      agentRole: 'worker' as const,
+      workerMode: 'persistent' as const,
+      mode: 'interactive' as const,
+      status: 'running' as const,
+      workingDirectory: '/tmp',
+      createdAt: staleTimestamp,
+      lastActivityAt: staleTimestamp,
+    };
+    let sessionAlive = true;
+    (sessionManager.getActiveSession as ReturnType<typeof mock>).mockImplementation((id: EntityId) => {
+      if (id !== workerId) return undefined;
+      return sessionAlive ? fakeSession : undefined;
+    });
+    (sessionManager.stopSession as ReturnType<typeof mock>).mockImplementation(async () => {
+      sessionAlive = false;
+    });
+
+    await daemon.tick();
+
+    expect(sessionManager.stopSession).toHaveBeenCalledWith(
+      'session-respawn-001',
+      expect.objectContaining({ graceful: false })
+    );
+    expect(sessionManager.startSession).toHaveBeenCalledWith(
+      workerId,
+      expect.objectContaining({ workingDirectory: expect.any(String) })
+    );
+  });
+});
+
+// ============================================================================
 // Per-Director Target Branch Propagation
 // ============================================================================
 
