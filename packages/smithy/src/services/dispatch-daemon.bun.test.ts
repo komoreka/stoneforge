@@ -7605,3 +7605,149 @@ describe('ensurePersistentWorkerSessions', () => {
     expect(sessionManager.startSession).not.toHaveBeenCalled();
   });
 });
+
+// ============================================================================
+// pollPersistentWorkerDispatch
+// ============================================================================
+
+describe('pollPersistentWorkerDispatch', () => {
+  let api: QuarryAPI;
+  let inboxService: InboxService;
+  let agentRegistry: AgentRegistry;
+  let taskAssignment: TaskAssignmentService;
+  let dispatchService: DispatchService;
+  let sessionManager: SessionManager;
+  let worktreeManager: WorktreeManager;
+  let stewardScheduler: StewardScheduler;
+  let daemon: DispatchDaemon;
+  let testDbPath: string;
+  let systemEntity: EntityId;
+
+  beforeEach(async () => {
+    testDbPath = `/tmp/dispatch-daemon-pw-dispatch-test-${Date.now()}-${Math.random().toString(36).slice(2)}.db`;
+    const storage = createStorage({ path: testDbPath, create: true });
+    initializeSchema(storage);
+
+    api = createQuarryAPI(storage);
+    inboxService = createInboxService(storage);
+    agentRegistry = createAgentRegistry(api);
+    taskAssignment = createTaskAssignmentService(api);
+    dispatchService = createDispatchService(api, taskAssignment, agentRegistry);
+    sessionManager = createMockSessionManager();
+    worktreeManager = createMockWorktreeManager();
+    stewardScheduler = createMockStewardScheduler();
+
+    const { createEntity, EntityTypeValue } = await import('@stoneforge/core');
+    const entity = await createEntity({
+      name: 'test-system',
+      entityType: EntityTypeValue.SYSTEM,
+      createdBy: 'system:test' as EntityId,
+    });
+    const saved = await api.create(entity as unknown as Record<string, unknown> & { createdBy: EntityId });
+    systemEntity = saved.id as unknown as EntityId;
+
+    daemon = createDispatchDaemon(
+      api, agentRegistry, sessionManager, dispatchService,
+      worktreeManager, taskAssignment, stewardScheduler, inboxService,
+      {
+        ensureTargetBranchExists: mockEnsureTargetBranchExists,
+        pollIntervalMs: 100,
+        orphanRecoveryEnabled: false,
+        persistentWorkerSessionEnsureEnabled: false,
+        workerAvailabilityPollEnabled: false,
+        inboxPollEnabled: false,
+        stewardTriggerPollEnabled: false,
+        workflowTaskPollEnabled: false,
+      }
+    );
+  });
+
+  afterEach(async () => {
+    await daemon.stop();
+    if (fs.existsSync(testDbPath)) fs.unlinkSync(testDbPath);
+  });
+
+  test('dispatches unassigned task to idle persistent worker', async () => {
+    const worker = await agentRegistry.registerWorker({
+      name: 'PersistentDispatchWorker',
+      workerMode: 'persistent',
+      createdBy: systemEntity,
+      maxConcurrentTasks: 1,
+    });
+    const task = await createTask({
+      title: 'Task to auto-dispatch',
+      createdBy: systemEntity,
+      status: TaskStatus.OPEN,
+    });
+    await api.create(task as unknown as Record<string, unknown> & { createdBy: EntityId });
+
+    const result = await daemon.pollPersistentWorkerDispatch();
+
+    expect(result.processed).toBe(1);
+    const assigned = await api.get<import('@stoneforge/core').Task>(task.id as unknown as import('@stoneforge/core').ElementId);
+    expect(assigned?.assignee).toBe(worker.id);
+  });
+
+  test('skips persistent worker that already has an in_progress task', async () => {
+    const worker = await agentRegistry.registerWorker({
+      name: 'BusyWorker',
+      workerMode: 'persistent',
+      createdBy: systemEntity,
+      maxConcurrentTasks: 1,
+    });
+    // Create and assign an in_progress task to the worker
+    const existingTask = await createTask({
+      title: 'Already in progress',
+      createdBy: systemEntity,
+      status: TaskStatus.IN_PROGRESS,
+      assignee: worker.id as unknown as EntityId,
+    });
+    await api.create(existingTask as unknown as Record<string, unknown> & { createdBy: EntityId });
+
+    const newTask = await createTask({
+      title: 'Would-be dispatched',
+      createdBy: systemEntity,
+      status: TaskStatus.OPEN,
+    });
+    await api.create(newTask as unknown as Record<string, unknown> & { createdBy: EntityId });
+
+    const result = await daemon.pollPersistentWorkerDispatch();
+
+    expect(result.processed).toBe(0);
+    const notAssigned = await api.get<import('@stoneforge/core').Task>(newTask.id as unknown as import('@stoneforge/core').ElementId);
+    expect(notAssigned?.assignee).toBeUndefined();
+  });
+
+  test('skips ephemeral workers', async () => {
+    await agentRegistry.registerWorker({
+      name: 'EphemeralWorker',
+      workerMode: 'ephemeral',
+      createdBy: systemEntity,
+      maxConcurrentTasks: 1,
+    });
+    const task = await createTask({
+      title: 'Unassigned task',
+      createdBy: systemEntity,
+      status: TaskStatus.OPEN,
+    });
+    await api.create(task as unknown as Record<string, unknown> & { createdBy: EntityId });
+
+    const result = await daemon.pollPersistentWorkerDispatch();
+
+    expect(result.processed).toBe(0);
+  });
+
+  test('does not dispatch when no unassigned tasks exist', async () => {
+    await agentRegistry.registerWorker({
+      name: 'IdleWorker',
+      workerMode: 'persistent',
+      createdBy: systemEntity,
+      maxConcurrentTasks: 1,
+    });
+    // No tasks created
+
+    const result = await daemon.pollPersistentWorkerDispatch();
+
+    expect(result.processed).toBe(0);
+  });
+});
