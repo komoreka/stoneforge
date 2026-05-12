@@ -157,6 +157,8 @@ export const TaskTypeValue = {
   TASK: 'task',
   /** Maintenance, cleanup, technical debt */
   CHORE: 'chore',
+  /** Non-code operational work (deploys, config changes, runbooks) */
+  OPS: 'ops',
 } as const;
 
 export type TaskTypeValue = (typeof TaskTypeValue)[keyof typeof TaskTypeValue];

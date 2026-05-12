@@ -344,6 +344,17 @@ export async function mergeBranch(options: MergeBranchOptions): Promise<MergeBra
   // is available as a valid ref when creating new branches from remote HEAD.
   if (!localOnly) {
     await execAsync('git fetch origin', { cwd: workspaceRoot, encoding: 'utf8' });
+    // If sourceBranch only exists on the remote (common for agent task branches),
+    // create a local tracking ref so the merge command can resolve it.
+    const srcExistsLocally = await branchExistsLocally(workspaceRoot, sourceBranch);
+    if (!srcExistsLocally) {
+      await execAsync(`git fetch origin "${sourceBranch}:${sourceBranch}"`, {
+        cwd: workspaceRoot,
+        encoding: 'utf8',
+      }).catch(() => {
+        // Branch may not exist on remote either; the merge step will surface the error.
+      });
+    }
   }
 
   // Ensure the target branch exists (auto-creates review branches from main)

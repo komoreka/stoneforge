@@ -91,6 +91,8 @@ export interface HandoffTaskOptions {
   branch?: string;
   /** Override worktree path (defaults to current task worktree) */
   worktree?: string;
+  /** Target agent ID for directed handoff. When provided, task is assigned to this agent instead of returning to the pool. */
+  toAgent?: EntityId;
 }
 
 /**
@@ -564,7 +566,22 @@ export class TaskAssignmentServiceImpl implements TaskAssignmentService {
     let mergeRequestId: number | undefined;
 
     if (branch && this.mergeRequestProvider && options?.createMergeRequest !== false) {
-      const baseBranch = options?.baseBranch || currentMeta?.targetBranch || 'main';
+      // Resolution order: explicit --baseBranch → task's targetBranch metadata →
+      // workspace config (`merge.targetBranch`) → hardcoded `main`. Without the
+      // config layer, stewards (which cannot own a `targetBranch` field) had no
+      // way to set a project-wide target.
+      let configTargetBranch: string | undefined;
+      try {
+        const { loadConfig } = await import('@stoneforge/quarry');
+        const cfg = loadConfig();
+        const value = (cfg.merge as { targetBranch?: string | null } | undefined)?.targetBranch;
+        if (typeof value === 'string' && value.length > 0) {
+          configTargetBranch = value;
+        }
+      } catch {
+        // Config not loadable — fall through to hardcoded default
+      }
+      const baseBranch = options?.baseBranch || currentMeta?.targetBranch || configTargetBranch || 'main';
       let body = `## Task\n\n**ID:** ${task.id}\n**Title:** ${task.title}\n\n`;
       if (options?.summary) {
         body += `## Summary\n\n${options.summary}\n\n`;
@@ -682,11 +699,11 @@ export class TaskAssignmentServiceImpl implements TaskAssignmentService {
       metaUpdates as Partial<OrchestratorTaskMeta>
     );
 
-    // Update task: clear assignee, reset status to OPEN, update metadata
+    // Update task: clear assignee (or assign to target), reset status to OPEN, update metadata
     // Note: We store the handoff note in metadata since tasks use descriptionRef
     // Setting status to OPEN ensures dispatch daemon can pick up the task
     return this.api.update<Task>(taskId, {
-      assignee: undefined,
+      assignee: options.toAgent ?? undefined,
       status: TaskStatus.OPEN,
       metadata: newMeta,
     });
@@ -830,15 +847,13 @@ export class TaskAssignmentServiceImpl implements TaskAssignmentService {
       orchestratorMeta: getOrchestratorTaskMeta(task.metadata as Record<string, unknown> | undefined),
     }));
 
-    // Apply agent filter
+    // Apply agent filter — use root task.assignee only.
+    // orchestratorMeta.assignedAgent is historical audit data and diverges from
+    // task.assignee when sf task assign is used (quarry-layer direct update that
+    // doesn't propagate to orchestrator metadata). Reading both with an OR would
+    // make a task appear in two workers' queues simultaneously after reassignment.
     if (filter?.agentId !== undefined) {
-      assignments = assignments.filter((a) => {
-        // Check both task.assignee and orchestrator metadata
-        return (
-          a.task.assignee === filter.agentId ||
-          a.orchestratorMeta?.assignedAgent === filter.agentId
-        );
-      });
+      assignments = assignments.filter((a) => a.task.assignee === filter.agentId);
     }
 
     // Apply assignment status filter
@@ -900,9 +915,8 @@ export class TaskAssignmentServiceImpl implements TaskAssignmentService {
       return 'completed';
     }
 
-    // Check if unassigned (only for tasks not in terminal states)
-    const hasAssignment = task.assignee || orchestratorMeta?.assignedAgent;
-    if (!hasAssignment) {
+    // Check if unassigned — canonical field only (see getAgentTasks filter comment).
+    if (!task.assignee) {
       return 'unassigned';
     }
 
