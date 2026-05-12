@@ -1554,6 +1554,177 @@ describe('pollInboxes - duplicate message prevention', () => {
 });
 
 // ============================================================================
+// pollInboxes - persistent worker messageSession delivery failure
+// ============================================================================
+
+describe('pollInboxes - persistent worker message delivery failure', () => {
+  // Regression test for: processPersistentAgentMessage marked inbox items as read
+  // unconditionally, even when sessionManager.messageSession() returned {success:false}.
+  // Messages sent to workers with degraded PTY sessions (buffer full, long-running session)
+  // were silently dropped. Fix: leave the item unread on failure so it retries next cycle.
+
+  let api: QuarryAPI;
+  let inboxService: InboxService;
+  let agentRegistry: AgentRegistry;
+  let taskAssignment: TaskAssignmentService;
+  let dispatchService: DispatchService;
+  let sessionManager: SessionManager;
+  let worktreeManager: WorktreeManager;
+  let stewardScheduler: StewardScheduler;
+  let daemon: DispatchDaemon;
+  let testDbPath: string;
+  let systemEntity: EntityId;
+
+  beforeEach(async () => {
+    testDbPath = `/tmp/dispatch-daemon-delivery-failure-${Date.now()}-${Math.random().toString(36).slice(2)}.db`;
+    const storage = createStorage({ path: testDbPath, create: true });
+    initializeSchema(storage);
+
+    api = createQuarryAPI(storage);
+    inboxService = createInboxService(storage);
+    agentRegistry = createAgentRegistry(api);
+    taskAssignment = createTaskAssignmentService(api);
+    dispatchService = createDispatchService(api, taskAssignment, agentRegistry);
+    // messageSession returns success by default; individual tests override this
+    sessionManager = createMockSessionManager();
+    worktreeManager = createMockWorktreeManager();
+    stewardScheduler = createMockStewardScheduler();
+
+    const { createEntity, EntityTypeValue } = await import('@stoneforge/core');
+    const entity = await createEntity({
+      name: 'test-system-delivery-failure',
+      entityType: EntityTypeValue.SYSTEM,
+      createdBy: 'system:test' as EntityId,
+    });
+    const saved = await api.create(entity as unknown as Record<string, unknown> & { createdBy: EntityId });
+    systemEntity = saved.id as unknown as EntityId;
+
+    daemon = createDispatchDaemon(
+      api,
+      agentRegistry,
+      sessionManager,
+      dispatchService,
+      worktreeManager,
+      taskAssignment,
+      stewardScheduler,
+      inboxService,
+      {
+        ensureTargetBranchExists: mockEnsureTargetBranchExists,
+        pollIntervalMs: 5000,
+        workerAvailabilityPollEnabled: false,
+        inboxPollEnabled: true,
+        stewardTriggerPollEnabled: false,
+        workflowTaskPollEnabled: false,
+      }
+    );
+  });
+
+  afterEach(async () => {
+    await daemon.stop();
+    if (fs.existsSync(testDbPath)) {
+      fs.unlinkSync(testDbPath);
+    }
+  });
+
+  async function createPersistentWorkerWithSession(name: string): Promise<{ workerId: EntityId; channelId: import('@stoneforge/core').ChannelId }> {
+    const { createGroupChannel } = await import('@stoneforge/core');
+    const worker = await agentRegistry.registerWorker({
+      name,
+      workerMode: 'persistent',
+      createdBy: systemEntity,
+      maxConcurrentTasks: 1,
+    });
+    const workerId = worker.id as unknown as EntityId;
+
+    // Create a channel for this worker so getAgentMetadata returns a channelId
+    const channel = await createGroupChannel({
+      name: `chan-${name}`,
+      createdBy: systemEntity,
+      members: [systemEntity, workerId],
+    });
+    const savedChannel = await api.create(channel as unknown as Record<string, unknown> & { createdBy: EntityId });
+    const channelId = savedChannel.id as unknown as import('@stoneforge/core').ChannelId;
+    await agentRegistry.updateAgentMetadata(workerId, { channelId } as never);
+
+    // Inject a running session into the mock session manager
+    const sessionRecord: SessionRecord = {
+      id: `session-${name}-${Date.now()}`,
+      agentId: workerId,
+      agentRole: 'worker',
+      workerMode: 'persistent',
+      status: 'running',
+      createdAt: createTimestamp(),
+      startedAt: createTimestamp(),
+      lastActivityAt: createTimestamp(),
+    };
+    (sessionManager.getActiveSession as ReturnType<typeof mock>).mockImplementation((id: EntityId) =>
+      id === workerId ? sessionRecord : null
+    );
+
+    return { workerId, channelId };
+  }
+
+  async function addInboxItem(workerId: EntityId, channelId: import('@stoneforge/core').ChannelId): Promise<void> {
+    const { createDocument, createMessage, ContentType: CT, InboxSourceType: IST } = await import('@stoneforge/core');
+    const doc = await createDocument({
+      title: `msg-${Date.now()}`,
+      content: 'Task assignment message',
+      contentType: CT.TEXT,
+      createdBy: systemEntity,
+    });
+    const savedDoc = await api.create(doc as unknown as Record<string, unknown> & { createdBy: EntityId });
+
+    const msg = await createMessage({
+      channelId,
+      sender: systemEntity,
+      contentRef: savedDoc.id as unknown as import('@stoneforge/core').DocumentId,
+    });
+    const savedMsg = await api.create(msg as unknown as Record<string, unknown> & { createdBy: EntityId });
+
+    inboxService.addToInbox({
+      recipientId: workerId,
+      messageId: savedMsg.id as unknown as import('@stoneforge/core').MessageId,
+      channelId,
+      sourceType: IST.DIRECT,
+      createdBy: systemEntity,
+    });
+  }
+
+  test('leaves inbox item unread when messageSession returns success:false', async () => {
+    const { workerId, channelId } = await createPersistentWorkerWithSession('broken-pty-worker');
+    await addInboxItem(workerId, channelId);
+
+    // Simulate PTY write failure
+    (sessionManager.messageSession as ReturnType<typeof mock>).mockImplementation(async () => ({
+      success: false,
+      error: 'PTY write failed: EPIPE',
+    }));
+
+    await daemon.pollInboxes();
+
+    // Item must still be unread — the daemon must not consume messages it failed to deliver
+    const unread = inboxService.getInbox(workerId, { status: 'unread' as unknown as import('@stoneforge/core').InboxStatus });
+    expect(unread.length).toBe(1);
+  });
+
+  test('marks inbox item as read when messageSession succeeds', async () => {
+    const { workerId, channelId } = await createPersistentWorkerWithSession('healthy-pty-worker');
+    await addInboxItem(workerId, channelId);
+
+    // Default mock returns success:true
+    (sessionManager.messageSession as ReturnType<typeof mock>).mockImplementation(async () => ({
+      success: true,
+    }));
+
+    await daemon.pollInboxes();
+
+    // Item must be read — delivery succeeded
+    const unread = inboxService.getInbox(workerId, { status: 'unread' as unknown as import('@stoneforge/core').InboxStatus });
+    expect(unread.length).toBe(0);
+  });
+});
+
+// ============================================================================
 // Plan Auto-Complete Tests
 // ============================================================================
 
