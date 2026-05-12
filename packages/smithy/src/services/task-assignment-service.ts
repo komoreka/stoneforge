@@ -374,6 +374,9 @@ export class TaskAssignmentServiceImpl implements TaskAssignmentService {
     if (!task || task.type !== ElementType.TASK) {
       throw new Error(`Task not found: ${taskId}`);
     }
+    if (task.status === TaskStatus.CLOSED) {
+      throw new Error(`Cannot assign task ${taskId}: task is closed`);
+    }
 
     // Note: Previously there was a guard against reassignment here, but
     // the dispatch service needs to support task reassignment. The dispatch
@@ -459,6 +462,9 @@ export class TaskAssignmentServiceImpl implements TaskAssignmentService {
     const task = await this.api.get<Task>(taskId);
     if (!task || task.type !== ElementType.TASK) {
       throw new Error(`Task not found: ${taskId}`);
+    }
+    if (task.status === TaskStatus.CLOSED) {
+      throw new Error(`Cannot start task ${taskId}: task is closed`);
     }
 
     const updates: Partial<OrchestratorTaskMeta> = {
@@ -628,6 +634,9 @@ export class TaskAssignmentServiceImpl implements TaskAssignmentService {
     const task = await this.api.get<Task>(taskId);
     if (!task || task.type !== ElementType.TASK) {
       throw new Error(`Task not found: ${taskId}`);
+    }
+    if (task.status === TaskStatus.CLOSED) {
+      throw new Error(`Cannot hand off task ${taskId}: task is closed`);
     }
 
     const currentMeta = getOrchestratorTaskMeta(task.metadata as Record<string, unknown> | undefined);

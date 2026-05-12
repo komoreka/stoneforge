@@ -1853,10 +1853,14 @@ export class DispatchDaemonImpl implements DispatchDaemon {
     this.emitter.emit('poll:start', 'closed-unmerged-reconciliation');
 
     try {
-      // Find tasks that are CLOSED but have a non-merged mergeStatus
+      // Find tasks that are CLOSED but were closed while still in an active merge state.
+      // Only reconcile in-flight states ('pending', 'testing', 'merging') — these represent
+      // tasks closed before the merge machinery could finish. Terminal failure states
+      // ('failed', 'conflict', 'test_failed') indicate the steward already gave up; a
+      // subsequent operator close on those tasks is intentional and must not be reversed.
       const stuckTasks = await this.taskAssignment.listAssignments({
         taskStatus: [TaskStatus.CLOSED],
-        mergeStatus: ['pending', 'testing', 'merging', 'conflict', 'test_failed', 'failed'],
+        mergeStatus: ['pending', 'testing', 'merging'],
       });
 
       const now = Date.now();
