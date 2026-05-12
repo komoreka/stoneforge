@@ -125,6 +125,7 @@ interface TaskHandoffOptions {
   branch?: string;
   worktree?: string;
   sessionId?: string;
+  to?: string;
 }
 
 const taskHandoffOptions: CommandOption[] = [
@@ -152,6 +153,12 @@ const taskHandoffOptions: CommandOption[] = [
     description: 'Session ID of the agent handing off (defaults to current session)',
     hasValue: true,
   },
+  {
+    name: 'to',
+    short: 't',
+    description: 'Target agent ID — assign directly to this agent instead of returning to the pool',
+    hasValue: true,
+  },
 ];
 
 async function taskHandoffHandler(
@@ -177,6 +184,7 @@ async function taskHandoffHandler(
       message: options.message,
       branch: options.branch,
       worktree: options.worktree,
+      toAgent: options.to ? options.to as import('@stoneforge/core').EntityId : undefined,
     });
 
     const mode = getOutputMode(options);
@@ -210,7 +218,12 @@ async function taskHandoffHandler(
       lines.push(`  Worktree:  ${options.worktree}`);
     }
     lines.push('');
-    lines.push('Task has been unassigned and is available for pickup by another agent.');
+    if (options.to) {
+      lines.push(`Task assigned to agent ${options.to} — daemon will notify them on the next poll cycle.`);
+    } else {
+      lines.push('Task has been returned to the unassigned pool.');
+      lines.push('Tip: use --to <agent-id> to route directly to a specific agent.');
+    }
 
     return success(task, lines.join('\n'));
   } catch (err) {

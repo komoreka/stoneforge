@@ -91,6 +91,8 @@ export interface HandoffTaskOptions {
   branch?: string;
   /** Override worktree path (defaults to current task worktree) */
   worktree?: string;
+  /** Target agent ID for directed handoff. When provided, task is assigned to this agent instead of returning to the pool. */
+  toAgent?: EntityId;
 }
 
 /**
@@ -697,11 +699,11 @@ export class TaskAssignmentServiceImpl implements TaskAssignmentService {
       metaUpdates as Partial<OrchestratorTaskMeta>
     );
 
-    // Update task: clear assignee, reset status to OPEN, update metadata
+    // Update task: clear assignee (or assign to target), reset status to OPEN, update metadata
     // Note: We store the handoff note in metadata since tasks use descriptionRef
     // Setting status to OPEN ensures dispatch daemon can pick up the task
     return this.api.update<Task>(taskId, {
-      assignee: undefined,
+      assignee: options.toAgent ?? undefined,
       status: TaskStatus.OPEN,
       metadata: newMeta,
     });
