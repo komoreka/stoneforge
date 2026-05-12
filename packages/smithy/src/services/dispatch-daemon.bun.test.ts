@@ -7478,3 +7478,130 @@ describe('getDispatchHealth - pollStale detection', () => {
     }
   });
 });
+
+// ============================================================================
+// ensurePersistentWorkerSessions
+// ============================================================================
+
+describe('ensurePersistentWorkerSessions', () => {
+  let api: QuarryAPI;
+  let inboxService: InboxService;
+  let agentRegistry: AgentRegistry;
+  let taskAssignment: TaskAssignmentService;
+  let dispatchService: DispatchService;
+  let sessionManager: SessionManager;
+  let worktreeManager: WorktreeManager;
+  let stewardScheduler: StewardScheduler;
+  let daemon: DispatchDaemon;
+  let testDbPath: string;
+  let systemEntity: EntityId;
+
+  beforeEach(async () => {
+    testDbPath = `/tmp/dispatch-daemon-ensure-sessions-test-${Date.now()}-${Math.random().toString(36).slice(2)}.db`;
+    const storage = createStorage({ path: testDbPath, create: true });
+    initializeSchema(storage);
+
+    api = createQuarryAPI(storage);
+    inboxService = createInboxService(storage);
+    agentRegistry = createAgentRegistry(api);
+    taskAssignment = createTaskAssignmentService(api);
+    dispatchService = createDispatchService(api, taskAssignment, agentRegistry);
+    sessionManager = createMockSessionManager();
+    worktreeManager = createMockWorktreeManager();
+    stewardScheduler = createMockStewardScheduler();
+
+    const { createEntity, EntityTypeValue } = await import('@stoneforge/core');
+    const entity = await createEntity({
+      name: 'test-system',
+      entityType: EntityTypeValue.SYSTEM,
+      createdBy: 'system:test' as EntityId,
+    });
+    const saved = await api.create(entity as unknown as Record<string, unknown> & { createdBy: EntityId });
+    systemEntity = saved.id as unknown as EntityId;
+
+    daemon = createDispatchDaemon(
+      api, agentRegistry, sessionManager, dispatchService,
+      worktreeManager, taskAssignment, stewardScheduler, inboxService,
+      {
+        ensureTargetBranchExists: mockEnsureTargetBranchExists,
+        pollIntervalMs: 100,
+        orphanRecoveryEnabled: false,
+        workerAvailabilityPollEnabled: false,
+        inboxPollEnabled: false,
+        stewardTriggerPollEnabled: false,
+        workflowTaskPollEnabled: false,
+      }
+    );
+  });
+
+  afterEach(async () => {
+    await daemon.stop();
+    if (fs.existsSync(testDbPath)) fs.unlinkSync(testDbPath);
+  });
+
+  test('spawns standby session for persistent worker with no active session', async () => {
+    await agentRegistry.registerWorker({
+      name: 'StandbyWorker',
+      workerMode: 'persistent',
+      createdBy: systemEntity,
+      maxConcurrentTasks: 1,
+    });
+
+    await daemon.ensurePersistentWorkerSessions();
+
+    expect(sessionManager.startSession).toHaveBeenCalledTimes(1);
+    expect(sessionManager.startSession).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({ workingDirectory: expect.any(String), initialPrompt: expect.any(String) })
+    );
+  });
+
+  test('does not spawn session for persistent worker that already has one', async () => {
+    const worker = await agentRegistry.registerWorker({
+      name: 'ActiveWorker',
+      workerMode: 'persistent',
+      createdBy: systemEntity,
+      maxConcurrentTasks: 1,
+    });
+
+    (sessionManager.getActiveSession as ReturnType<typeof mock>).mockReturnValue({
+      id: 'existing-session',
+      agentId: worker.id,
+      status: 'running',
+      mode: 'interactive',
+      createdAt: new Date().toISOString(),
+      lastActivityAt: new Date().toISOString(),
+    });
+
+    await daemon.ensurePersistentWorkerSessions();
+
+    expect(sessionManager.startSession).not.toHaveBeenCalled();
+  });
+
+  test('does not spawn session for disabled persistent worker', async () => {
+    const worker = await agentRegistry.registerWorker({
+      name: 'DisabledWorker',
+      workerMode: 'persistent',
+      createdBy: systemEntity,
+      maxConcurrentTasks: 1,
+    });
+    await agentRegistry.updateAgentMetadata(worker.id as unknown as EntityId, { disabled: true } as never);
+
+    await daemon.ensurePersistentWorkerSessions();
+
+    expect(sessionManager.startSession).not.toHaveBeenCalled();
+  });
+
+  test('does not spawn session for ephemeral worker', async () => {
+    await agentRegistry.registerWorker({
+      name: 'EphemeralWorker',
+      workerMode: 'ephemeral',
+      createdBy: systemEntity,
+      maxConcurrentTasks: 1,
+    });
+
+    await daemon.ensurePersistentWorkerSessions();
+
+    expect(sessionManager.startSession).not.toHaveBeenCalled();
+  });
+});
