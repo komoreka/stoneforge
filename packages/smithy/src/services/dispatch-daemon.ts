@@ -259,6 +259,23 @@ export interface DispatchDaemonConfig {
   readonly maxResumeAttemptsBeforeRecovery?: number;
 
   /**
+   * When true, prepend a Claude Code `/goal` directive to worker task prompts
+   * so Claude auto-continues across turns until the task is closed or handed
+   * off. Requires Claude Code v2.1.139+ (the version that introduced /goal).
+   *
+   * Tradeoffs:
+   * - Reduces "worker exits mid-task" cases where Claude prematurely ends a turn
+   * - Adds a per-turn Haiku eval cost (small but cumulative across many workers)
+   * - Can interact with maxResumeAttemptsBeforeRecovery: if Claude's /goal loop
+   *   and the daemon's resume loop both fire, the worker may run longer than
+   *   the daemon's recovery threshold expects. Consider raising the resume cap
+   *   when enabling this.
+   *
+   * Default: false (opt-in)
+   */
+  readonly goalDirectiveEnabled?: boolean;
+
+  /**
    * Maximum session duration in ms before the daemon terminates it.
    * Prevents stuck workers from blocking their slot indefinitely.
    * Default: 0 (disabled).
@@ -423,6 +440,7 @@ interface NormalizedConfig {
   stuckMergeRecoveryEnabled: boolean;
   stuckMergeRecoveryGracePeriodMs: number;
   maxResumeAttemptsBeforeRecovery: number;
+  goalDirectiveEnabled: boolean;
   maxSessionDurationMs: number;
   maxStewardSessionDurationMs: number;
   idleWorkerSessionThresholdMs: number;
@@ -2343,6 +2361,7 @@ export class DispatchDaemonImpl implements DispatchDaemon {
       stuckMergeRecoveryEnabled: config?.stuckMergeRecoveryEnabled ?? true,
       stuckMergeRecoveryGracePeriodMs: config?.stuckMergeRecoveryGracePeriodMs ?? 600_000,
       maxResumeAttemptsBeforeRecovery: config?.maxResumeAttemptsBeforeRecovery ?? 3,
+      goalDirectiveEnabled: config?.goalDirectiveEnabled ?? false,
       maxSessionDurationMs: config?.maxSessionDurationMs ?? 0,
       maxStewardSessionDurationMs: config?.maxStewardSessionDurationMs ?? 30 * 60 * 1000,
       idleWorkerSessionThresholdMs: config?.idleWorkerSessionThresholdMs ?? 30 * 60 * 1000,
@@ -3408,6 +3427,20 @@ export class DispatchDaemonImpl implements DispatchDaemon {
    */
   private async buildTaskPrompt(task: Task, workerId: EntityId): Promise<string> {
     const parts: string[] = [];
+
+    // Optional /goal directive — must be the very first line so Claude Code
+    // parses it as a slash command on session start. The goal condition is
+    // evaluated per turn by a Haiku model; we phrase it as a concrete state
+    // the worker can observably reach (closed/REVIEW or handed off).
+    if (this.config.goalDirectiveEnabled) {
+      parts.push(
+        `/goal Task ${task.id} reaches one of these terminal states: ` +
+        `(a) status is 'review' or 'closed' (worker ran sf task complete), or ` +
+        `(b) task is reassigned to a different agent (worker ran sf task handoff). ` +
+        `Verify with: sf task view ${task.id}`,
+        ''
+      );
+    }
 
     // Look up the worker's actual mode — persistent workers must receive their
     // own prompt (not the ephemeral one that tells them to exit after each task).
