@@ -94,6 +94,17 @@ export interface CostService {
 // ============================================================================
 
 export function createCostService(storage: StorageBackend): CostService {
+  // Suppress repeat "no pricing found" warnings per unique model. Cost calculations
+  // run on every metrics enrichment cycle (every poll), so without this guard a
+  // single missing model entry produces hundreds of identical log lines per minute.
+  const warnedMissingPricing = new Set<string>();
+  function warnMissingPricingOnce(model: string, suffix: string = ''): void {
+    const key = `${model}|${suffix}`;
+    if (warnedMissingPricing.has(key)) return;
+    warnedMissingPricing.add(key);
+    logger.warn(`No pricing found for model "${model}"${suffix}, using default (Sonnet) pricing`);
+  }
+
   /**
    * Compute costs for a model-grouped metric entry.
    * The group key is the model name, so we can look up pricing directly.
@@ -110,7 +121,7 @@ export function createCostService(storage: StorageBackend): CostService {
     );
 
     if (!result.modelMatched && model !== 'unknown') {
-      logger.warn(`No pricing found for model "${model}", using default (Sonnet) pricing`);
+      warnMissingPricingOnce(model);
     }
 
     return {
@@ -183,7 +194,7 @@ export function createCostService(storage: StorageBackend): CostService {
         const { pricing, matched } = lookupModelPricing(model);
 
         if (!matched && model !== 'unknown') {
-          logger.warn(`No pricing found for model "${model}", using default (Sonnet) pricing`);
+          warnMissingPricingOnce(model);
         }
 
         const cost = calculateCostFromPricing(
@@ -244,7 +255,7 @@ export function createCostService(storage: StorageBackend): CostService {
         );
 
         if (!result.modelMatched && model !== 'unknown') {
-          logger.warn(`No pricing found for model "${model}", using default (Sonnet) pricing`);
+          warnMissingPricingOnce(model);
         }
 
         return {
@@ -281,7 +292,7 @@ export function createCostService(storage: StorageBackend): CostService {
       const result = calculateCost(model, provider, inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens);
 
       if (!result.modelMatched) {
-        logger.warn(`No pricing found for model "${model}" (provider: "${provider}"), using default (Sonnet) pricing`);
+        warnMissingPricingOnce(model, ` (provider: "${provider}")`);
       }
 
       return {
