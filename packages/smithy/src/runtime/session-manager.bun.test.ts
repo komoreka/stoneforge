@@ -857,6 +857,34 @@ describe('SessionManager', () => {
 
       expect(result.success).toBe(true);
     });
+
+    test('rejects self-addressed message (senderId equals session agentId)', async () => {
+      // Defensive guard: a message must never be addressed FROM an agent TO that
+      // same agent's session. This produces the self-ping loop symptom observed
+      // in production (Bug 10 successor — daemon-side self-dispatch).
+      const agent = agents.get(testAgentId)!;
+      const updatedAgent = {
+        ...agent,
+        metadata: {
+          ...agent.metadata,
+          agent: {
+            ...(agent.metadata?.agent as AgentMetadata),
+            channelId: 'channel-test' as ChannelId,
+          } as AgentMetadata,
+        },
+      } as AgentEntity;
+      agents.set(testAgentId, updatedAgent);
+
+      const { session } = await sessionManager.startSession(testAgentId);
+
+      const result = await sessionManager.messageSession(session.id, {
+        content: 'Hello agent',
+        senderId: testAgentId,
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('Self-addressed message rejected');
+    });
   });
 
   describe('getEventEmitter', () => {

@@ -131,6 +131,15 @@ export const RAPID_EXIT_THRESHOLD_MS = 10_000;
 export const RATE_LIMIT_SESSION_PATTERN_COUNT = 3;
 
 /**
+ * Number of consecutive "task assigned to you" notifications the daemon may
+ * send to the same (worker, task) pair while task status and assignee remain
+ * unchanged before the loop-guard hard-suppresses further dispatches. After
+ * this threshold a single [LOOP-GUARD] warning is logged and the operator is
+ * expected to intervene (close the task or reassign).
+ */
+export const LOOP_GUARD_THRESHOLD = 3;
+
+/**
  * Maximum gap (in milliseconds) between consecutive session starts to
  * consider them part of a rapid-retry pattern. Sessions started within
  * this window of each other suggest automatic retries hitting rate limits.
@@ -726,6 +735,19 @@ export class DispatchDaemonImpl implements DispatchDaemon {
    * for genuinely-new task assignments after a recent ping for a different task.
    */
   private readonly lastPreAssignedNotifyAt = new Map<string, number>();
+
+  /**
+   * Loop-guard state for Pass 1 notifications. Tracks consecutive notifications
+   * sent to a (worker, task) pair while task state remains unchanged. After
+   * LOOP_GUARD_THRESHOLD identical-state notifications, further dispatches are
+   * hard-suppressed and a [LOOP-GUARD] warning is logged once. Counter resets
+   * automatically when task status or assignee transitions.
+   * Key format: `${workerId}:${taskId}`.
+   */
+  private readonly loopGuardState = new Map<
+    string,
+    { count: number; lastStateKey: string; suppressionLogged: boolean }
+  >();
 
   /**
    * Resolves once the startup background orphan recovery has completed (or
@@ -3689,13 +3711,42 @@ export class DispatchDaemonImpl implements DispatchDaemon {
           }
         }
 
+        // Loop-guard: count consecutive notifications with the task state
+        // unchanged since the last successful delivery. After threshold, hard-
+        // suppress further dispatches on this (worker, task) pair until state
+        // changes. Catches Bug 5 / Bug 9 / handoff-divergence loops where the
+        // operator has to intervene to break the cycle.
+        const stateKey = `${assignment.task.status}|${String(assignment.task.assignee)}`;
+        const guardEntry = this.loopGuardState.get(cooldownKey);
+        if (guardEntry && guardEntry.lastStateKey === stateKey && guardEntry.count >= LOOP_GUARD_THRESHOLD) {
+          if (!guardEntry.suppressionLogged) {
+            logger.warn(
+              `[LOOP-GUARD] Suppressed dispatch to ${worker.name} on ${assignment.taskId} after ${guardEntry.count} ` +
+              `consecutive notifications without state change. Likely Bug 5/Bug 9 divergence; operator action required ` +
+              `(sf task close or sf task assign).`
+            );
+            guardEntry.suppressionLogged = true;
+            this.loopGuardState.set(cooldownKey, guardEntry);
+          }
+          continue;
+        }
+
         const notice = `**Task assigned to you:** ${assignment.task.title} (${assignment.taskId})\n\nCheck your task list with \`sf task list --assignee ${workerId}\` and begin working on this task now.`;
         const deliveryResult = await this.sessionManager.messageSession(activeSession.id, {
           content: notice,
-          senderId: workerId,
+          // senderId omitted on purpose — defaults to 'system' inside messageSession.
+          // Setting senderId to workerId here would make the message appear as if it
+          // came FROM the recipient TO themselves, producing the visible self-ping loop.
         });
         if (deliveryResult.success) {
           this.lastPreAssignedNotifyAt.set(cooldownKey, Date.now());
+          // Update loop-guard counter
+          const prev = this.loopGuardState.get(cooldownKey);
+          if (prev && prev.lastStateKey === stateKey) {
+            this.loopGuardState.set(cooldownKey, { ...prev, count: prev.count + 1 });
+          } else {
+            this.loopGuardState.set(cooldownKey, { count: 1, lastStateKey: stateKey, suppressionLogged: false });
+          }
           logger.info(`[persistent-worker-dispatch] Notified ${worker.name} about pre-assigned task ${assignment.taskId}`);
         }
       }
@@ -3770,7 +3821,7 @@ export class DispatchDaemonImpl implements DispatchDaemon {
             const notice = `**Task dispatched to you:** ${task.title} (${task.id})\n\nCheck your task list with \`sf task list --assignee ${workerId}\` and begin working on this task now.`;
             const deliveryResult = await this.sessionManager.messageSession(activeSession.id, {
               content: notice,
-              senderId: workerId,
+              // senderId omitted — same reason as the Pass 1 self-ping fix above.
             });
             if (!deliveryResult.success) {
               logger.warn(

@@ -7901,4 +7901,93 @@ describe('pollPersistentWorkerDispatch', () => {
     // messageSession should be called exactly once across the three polls
     expect(messageSessionMock.mock.calls.length).toBe(1);
   });
+
+  test('GUARD 1: Pass 1 notification never addresses message FROM the recipient agent (self-ping prevention)', async () => {
+    // Synthetic repro of the production self-ping loop: assign T to A, mimic
+    // metadata.orchestrator.assignedAgent=A, observe A's session. Expected:
+    // zero "Task assigned to you" dispatches that name A as the sender.
+    const worker = await agentRegistry.registerWorker({
+      name: 'SelfPingVictim',
+      workerMode: 'persistent',
+      createdBy: systemEntity,
+      maxConcurrentTasks: 1,
+    });
+    const raw = await createTask({
+      title: 'Task that should not self-ping',
+      createdBy: systemEntity,
+      status: TaskStatus.OPEN,
+      assignee: worker.id as unknown as EntityId,
+    });
+    const saved = await api.create(raw as unknown as Record<string, unknown> & { createdBy: EntityId }) as import('@stoneforge/core').Task;
+
+    await api.update(saved.id as unknown as import('@stoneforge/core').ElementId, {
+      metadata: updateOrchestratorTaskMeta(undefined, {
+        assignedAgent: worker.id as unknown as EntityId,
+      }),
+    });
+
+    await (sessionManager as ReturnType<typeof createMockSessionManager>).startSession(
+      worker.id as unknown as EntityId
+    );
+
+    const messageSessionMock = sessionManager.messageSession as ReturnType<typeof mock>;
+    messageSessionMock.mockClear();
+
+    await daemon.pollPersistentWorkerDispatch();
+
+    // Notification must have fired (worker has an OPEN assigned task with an active session)
+    expect(messageSessionMock.mock.calls.length).toBe(1);
+    // BUT the senderId must NOT be the recipient's own id — that's the bug we're guarding against
+    const callArgs = messageSessionMock.mock.calls[0][1] as { senderId?: unknown };
+    expect(callArgs.senderId).not.toBe(worker.id);
+  });
+
+  test('GUARD 2: loop-guard suppresses dispatch after threshold consecutive notifications without state change', async () => {
+    // After LOOP_GUARD_THRESHOLD (3) consecutive identical-state notifications,
+    // the loop-guard hard-suppresses further dispatches on the same (worker, task)
+    // pair and logs a [LOOP-GUARD] warning once.
+    const worker = await agentRegistry.registerWorker({
+      name: 'StuckLoopWorker',
+      workerMode: 'persistent',
+      createdBy: systemEntity,
+      maxConcurrentTasks: 1,
+    });
+    const raw = await createTask({
+      title: 'Task stuck in loop',
+      createdBy: systemEntity,
+      status: TaskStatus.OPEN,
+      assignee: worker.id as unknown as EntityId,
+    });
+    const saved = await api.create(raw as unknown as Record<string, unknown> & { createdBy: EntityId }) as import('@stoneforge/core').Task;
+
+    await api.update(saved.id as unknown as import('@stoneforge/core').ElementId, {
+      metadata: updateOrchestratorTaskMeta(undefined, {
+        assignedAgent: worker.id as unknown as EntityId,
+      }),
+    });
+
+    await (sessionManager as ReturnType<typeof createMockSessionManager>).startSession(
+      worker.id as unknown as EntityId
+    );
+
+    const messageSessionMock = sessionManager.messageSession as ReturnType<typeof mock>;
+    messageSessionMock.mockClear();
+
+    // Reconfigure with a near-zero cooldown so multiple notifications can fire in quick succession.
+    // Without this, the per-(worker, task) cooldown would prevent us from reaching the guard threshold.
+    daemon.updateConfig({});
+    // Force-clear the cooldown map between calls by accessing the daemon's internal state
+    // via a sequence of polls that each advance time enough to bypass the cooldown.
+    // The cleanest way: reach into the daemon's notify map and clear it between iterations.
+    const daemonInternal = daemon as unknown as { lastPreAssignedNotifyAt: Map<string, number> };
+
+    // Fire 4 polls; the loop-guard threshold is 3, so the 4th should be hard-suppressed.
+    for (let i = 0; i < 4; i++) {
+      daemonInternal.lastPreAssignedNotifyAt.clear();
+      await daemon.pollPersistentWorkerDispatch();
+    }
+
+    // Expected: 3 notifications (one per state-identical poll up to threshold), 4th suppressed
+    expect(messageSessionMock.mock.calls.length).toBe(3);
+  });
 });

@@ -1075,6 +1075,20 @@ export class SessionManagerImpl implements SessionManager {
       return { success: false, error: 'Either contentRef or content must be provided' };
     }
 
+    // Defensive: a message must never be addressed FROM an agent TO that same
+    // agent's session. This is always a caller bug — typically a dispatch
+    // reminder where the sender id was set to the recipient by mistake — and
+    // produces the visible "[Message from el-X]: Task assigned to you (to el-X)"
+    // self-ping loop. Refusing here keeps any future regression from reaching
+    // the PTY, regardless of which call site introduced it.
+    if (options.senderId && options.senderId === session.agentId) {
+      return {
+        success: false,
+        error: `Self-addressed message rejected: senderId equals recipient agentId (${session.agentId}). ` +
+          `This is always a caller bug; use senderId: 'system' for daemon-originated notifications.`,
+      };
+    }
+
     // Get agent's channel
     const agent = await this.registry.getAgent(session.agentId);
     if (!agent) {
