@@ -28,6 +28,7 @@ import type {
   Document,
   Plan,
   Workflow,
+  Timestamp,
 } from '@stoneforge/core';
 import { InboxStatus, createTimestamp, TaskStatus, asEntityId, asElementId, PlanStatus, canAutoComplete, WorkflowStatus, computeWorkflowStatus, updateWorkflowStatus } from '@stoneforge/core';
 import type { QuarryAPI, InboxService } from '@stoneforge/quarry';
@@ -61,6 +62,7 @@ import {
   type TaskSessionHistoryEntry,
 } from '../types/task-meta.js';
 import type { OperationLogService } from './operation-log-service.js';
+import { HealthMonitor, createHealthMonitor } from './health-monitor.js';
 
 const logger = createLogger('dispatch-daemon');
 
@@ -130,6 +132,15 @@ export const RAPID_EXIT_THRESHOLD_MS = 10_000;
 export const RATE_LIMIT_SESSION_PATTERN_COUNT = 3;
 
 /**
+ * Number of consecutive "task assigned to you" notifications the daemon may
+ * send to the same (worker, task) pair while task status and assignee remain
+ * unchanged before the loop-guard hard-suppresses further dispatches. After
+ * this threshold a single [LOOP-GUARD] warning is logged and the operator is
+ * expected to intervene (close the task or reassign).
+ */
+export const LOOP_GUARD_THRESHOLD = 3;
+
+/**
  * Maximum gap (in milliseconds) between consecutive session starts to
  * consider them part of a rapid-retry pattern. Sessions started within
  * this window of each other suggest automatic retries hitting rate limits.
@@ -160,6 +171,17 @@ export interface DispatchDaemonConfig {
    * Default: 5000 (5 seconds)
    */
   readonly pollIntervalMs?: number;
+
+  /**
+   * Threshold in milliseconds beyond which `getDispatchHealth().pollStale`
+   * flips true if no poll cycle has completed. Detects a daemon whose
+   * `runPollCycle` is wedged mid-await (HTTP responsive but loop dead).
+   * Default: max(60000, 10 × pollIntervalMs).
+   * Set generously above any healthy poll cycle duration; orphan recovery
+   * + inbox triage + steward triggers can plausibly take 10+ seconds on a
+   * loaded workspace.
+   */
+  readonly pollStaleThresholdMs?: number;
 
   /**
    * Whether worker availability polling is enabled.
@@ -247,6 +269,38 @@ export interface DispatchDaemonConfig {
   readonly maxResumeAttemptsBeforeRecovery?: number;
 
   /**
+   * When true, the daemon runs an in-process HealthMonitor on each poll
+   * cycle. The monitor detects worker auth-loss (PTY output containing
+   * /login markers), self-addressed daemon pings (GUARD-1 regression
+   * sentinel), and repeat-identical dispatches (Bug 5 / Bug 9 signature).
+   * Findings surface to the Director via session message + operation log,
+   * throttled per (agentId, issueType) to one notification per 10 minutes.
+   *
+   * Detection only — does not auto-close tasks, stop agents, or modify
+   * orchestrator metadata.
+   *
+   * Default: true
+   */
+  readonly healthMonitorEnabled?: boolean;
+
+  /**
+   * When true, prepend a Claude Code `/goal` directive to worker task prompts
+   * so Claude auto-continues across turns until the task is closed or handed
+   * off. Requires Claude Code v2.1.139+ (the version that introduced /goal).
+   *
+   * Tradeoffs:
+   * - Reduces "worker exits mid-task" cases where Claude prematurely ends a turn
+   * - Adds a per-turn Haiku eval cost (small but cumulative across many workers)
+   * - Can interact with maxResumeAttemptsBeforeRecovery: if Claude's /goal loop
+   *   and the daemon's resume loop both fire, the worker may run longer than
+   *   the daemon's recovery threshold expects. Consider raising the resume cap
+   *   when enabling this.
+   *
+   * Default: false (opt-in)
+   */
+  readonly goalDirectiveEnabled?: boolean;
+
+  /**
    * Maximum session duration in ms before the daemon terminates it.
    * Prevents stuck workers from blocking their slot indefinitely.
    * Default: 0 (disabled).
@@ -260,6 +314,43 @@ export interface DispatchDaemonConfig {
    * Default: 1800000 (30 minutes).
    */
   readonly maxStewardSessionDurationMs?: number;
+
+  /**
+   * Threshold in milliseconds beyond which an idle persistent worker session
+   * with pending work is considered stale and killed so orphan recovery can
+   * respawn it fresh. Only triggers when the session has assigned tasks or
+   * unread inbox items — idle-but-empty sessions are left alone.
+   * Default: 1800000 (30 minutes).
+   */
+  readonly idleWorkerSessionThresholdMs?: number;
+
+  /**
+   * Whether idle persistent worker session reaping is enabled.
+   * When enabled, sessions idle beyond idleWorkerSessionThresholdMs that have
+   * pending work are stopped and orphan recovery respawns them with a fresh
+   * context. Handles cases such as lost auth ("Not logged in") where the
+   * process is alive but the session will never make progress.
+   * Default: true
+   */
+  readonly idleWorkerSessionReapEnabled?: boolean;
+
+  /**
+   * Whether persistent worker session ensuring is enabled.
+   * When enabled, the daemon spawns a standby session for any persistent worker
+   * that has no active session — regardless of task status. This covers the
+   * post-restart case where a worker's tasks have all moved to `review` (so
+   * orphan recovery skips them) but the worker still needs to be available for
+   * new inbox messages.
+   * Default: true
+   */
+  readonly persistentWorkerSessionEnsureEnabled?: boolean;
+
+  /**
+   * When true (default), the daemon will auto-dispatch unassigned ready tasks
+   * to idle persistent workers on each poll cycle.
+   * Default: true
+   */
+  readonly persistentWorkerDispatchEnabled?: boolean;
 
   /**
    * Callback fired when a session is started by the daemon.
@@ -294,6 +385,48 @@ export interface DispatchDaemonConfig {
    * Useful for testing without triggering real git remote operations.
    */
   readonly ensureTargetBranchExists?: (projectRoot: string, branchName: string) => Promise<void>;
+
+  /** Optional logger override. Defaults to the module-level dispatch-daemon logger. Used for testability. */
+  readonly logger?: { warn: (...args: unknown[]) => void; info?: (...args: unknown[]) => void };
+}
+
+/**
+ * Snapshot of the dispatch worker queue's stuck state.
+ * Computed on demand from the agent registry and ready-task list.
+ * A queue is "stuck" when there are unassigned ready tasks but no worker
+ * could take them (registered, not disabled, not terminated). At-capacity
+ * workers do NOT count: the queue is busy, not stuck.
+ */
+export interface DispatchHealth {
+  /** Count of ready tasks (api.ready result) that have no assignee. */
+  readonly readyUnassignedTasks: number;
+  /** Count of workers eligible to take new work: registered, not disabled, not terminated. */
+  readonly availableWorkers: number;
+  /** True iff readyUnassignedTasks > 0 && availableWorkers === 0. */
+  readonly stuck: boolean;
+  /** Convenience alias for stuck, matching the field name surfaced in the HTTP and UI layers. */
+  readonly hasStuckQueue: boolean;
+  /** Timestamp the snapshot was computed (ISO 8601). */
+  readonly computedAt: string;
+  /**
+   * Timestamp when the most recent poll cycle entered its try block (set BEFORE
+   * any await). Undefined if no cycle has ever started. Compared with
+   * `lastPollCompletedAt` and wall-clock to derive {@link pollStale}.
+   */
+  readonly lastPollStartedAt?: string;
+  /**
+   * Timestamp when the most recent poll cycle reached its `finally` block.
+   * Undefined if no cycle has completed yet. A wedged cycle leaves this old.
+   */
+  readonly lastPollCompletedAt?: string;
+  /**
+   * True when the daemon's HTTP server is alive but its poll loop has not
+   * completed a cycle within the configured staleness threshold. Indicates
+   * the daemon is wedged: process up, dispatch / scheduling / recovery down.
+   * Always false until a baseline `lastPollCompletedAt` exists, so a
+   * just-started daemon does not false-alarm.
+   */
+  readonly pollStale: boolean;
 }
 
 /**
@@ -301,7 +434,7 @@ export interface DispatchDaemonConfig {
  */
 export interface PollResult {
   /** The poll type */
-  readonly pollType: 'worker-availability' | 'inbox' | 'steward-trigger' | 'workflow-task' | 'orphan-recovery' | 'closed-unmerged-reconciliation' | 'stuck-merge-recovery' | 'plan-auto-complete' | 'workflow-auto-transition';
+  readonly pollType: 'worker-availability' | 'inbox' | 'steward-trigger' | 'workflow-task' | 'orphan-recovery' | 'closed-unmerged-reconciliation' | 'stuck-merge-recovery' | 'plan-auto-complete' | 'workflow-auto-transition' | 'persistent-worker-dispatch';
   /** Timestamp when the poll started */
   readonly startedAt: string;
   /** Duration of the poll in milliseconds */
@@ -319,6 +452,7 @@ export interface PollResult {
  */
 interface NormalizedConfig {
   pollIntervalMs: number;
+  pollStaleThresholdMs: number;
   workerAvailabilityPollEnabled: boolean;
   inboxPollEnabled: boolean;
   stewardTriggerPollEnabled: boolean;
@@ -331,13 +465,20 @@ interface NormalizedConfig {
   stuckMergeRecoveryEnabled: boolean;
   stuckMergeRecoveryGracePeriodMs: number;
   maxResumeAttemptsBeforeRecovery: number;
+  healthMonitorEnabled: boolean;
+  goalDirectiveEnabled: boolean;
   maxSessionDurationMs: number;
   maxStewardSessionDurationMs: number;
+  idleWorkerSessionThresholdMs: number;
+  idleWorkerSessionReapEnabled: boolean;
+  persistentWorkerSessionEnsureEnabled: boolean;
+  persistentWorkerDispatchEnabled: boolean;
   onSessionStarted?: OnSessionStartedCallback;
   projectRoot: string;
   directorInboxForwardingEnabled: boolean;
   directorInboxIdleThresholdMs: number;
   ensureTargetBranchExists: (projectRoot: string, branchName: string) => Promise<void>;
+  logger?: { warn: (...args: unknown[]) => void; info?: (...args: unknown[]) => void };
 }
 
 // ============================================================================
@@ -410,6 +551,26 @@ export interface DispatchDaemon {
   recoverOrphanedAssignments(): Promise<PollResult>;
 
   /**
+   * Manually triggers idle persistent worker session reaping.
+   * Stops sessions that have been idle beyond the configured threshold while
+   * they have pending work, so orphan recovery can respawn them fresh.
+   */
+  reapIdlePersistentWorkerSessions(): Promise<void>;
+
+  /**
+   * Manually triggers persistent worker session ensuring.
+   * Spawns a standby session for every non-disabled persistent worker that has
+   * no active session, regardless of task status.
+   */
+  ensurePersistentWorkerSessions(): Promise<void>;
+
+  /**
+   * Polls persistent workers and dispatches unassigned ready tasks to idle ones.
+   * Called automatically each poll cycle when persistentWorkerDispatchEnabled is true.
+   */
+  pollPersistentWorkerDispatch(): Promise<PollResult>;
+
+  /**
    * Manually triggers closed-but-unmerged task reconciliation.
    * Detects tasks with status=CLOSED but mergeStatus not 'merged'
    * and moves them back to REVIEW so merge stewards can pick them up.
@@ -478,13 +639,29 @@ export interface DispatchDaemon {
   /**
    * Gets the current configuration.
    */
-  getConfig(): Omit<Required<DispatchDaemonConfig>, 'onSessionStarted'> & { onSessionStarted?: OnSessionStartedCallback };
+  getConfig(): Omit<Required<DispatchDaemonConfig>, 'onSessionStarted' | 'logger'> & { onSessionStarted?: OnSessionStartedCallback; logger?: { warn: (...args: unknown[]) => void } };
 
   /**
    * Updates the configuration.
    * Takes effect on the next poll cycle.
    */
   updateConfig(config: Partial<DispatchDaemonConfig>): void;
+
+  // ----------------------------------------
+  // Health
+  // ----------------------------------------
+
+  /**
+   * Returns a snapshot of dispatch worker-queue health.
+   * Inexpensive (one ready-task query, one agent list query); safe to call from HTTP routes.
+   */
+  getDispatchHealth(): Promise<DispatchHealth>;
+
+  /**
+   * Manually triggers one complete poll cycle (same work as the interval-driven cycle).
+   * Useful for testing and for callers that want to force an immediate dispatch pass.
+   */
+  tick(): Promise<void>;
 
   // ----------------------------------------
   // Events
@@ -536,6 +713,25 @@ export class DispatchDaemonImpl implements DispatchDaemon {
   private currentPollCycle?: Promise<void>;
   private rateLimitSleepTimer?: NodeJS.Timeout;
   private lastWakeAt?: number;
+  /**
+   * ISO timestamp when the most recent `runPollCycle` invocation entered the
+   * try block. Set BEFORE awaiting any work, so a wedged-mid-cycle daemon
+   * leaves this value old. Compared against `lastPollCompletedAt` and
+   * wall-clock to detect staleness in {@link getDispatchHealth}.
+   */
+  private lastPollStartedAt?: Timestamp;
+  /**
+   * ISO timestamp when the most recent `runPollCycle` invocation finished
+   * (whether it succeeded or threw). Set in the `finally` block. A wedged
+   * cycle never reaches this assignment, so the value stays frozen at the
+   * previous successful completion (or undefined if no cycle has yet
+   * completed). Note that during a wedge, `lastPollStartedAt` also stops
+   * advancing because the re-entrancy guard at the top of `runPollCycle`
+   * bails on every subsequent setInterval tick — only the wedged cycle's
+   * own start-time is recorded. Surfaced via {@link getDispatchHealth}
+   * as the canonical "loop is alive" signal.
+   */
+  private lastPollCompletedAt?: Timestamp;
 
   /**
    * Tracks inbox item IDs that are currently being forwarded to persistent agents.
@@ -548,6 +744,27 @@ export class DispatchDaemonImpl implements DispatchDaemon {
    * Items are added before forwarding and removed after markAsRead() completes.
    */
   private readonly forwardingInboxItems = new Set<string>();
+  /**
+   * Per-(worker, task) timestamp of the last "task assigned to you" notification
+   * fired from Pass 1 of pollPersistentWorkerDispatch. Key format: `${workerId}:${taskId}`.
+   * The cooldown prevents the same worker from being re-pinged about the same task
+   * on every poll cycle. Worker-level keys (no task) would suppress notifications
+   * for genuinely-new task assignments after a recent ping for a different task.
+   */
+  private readonly lastPreAssignedNotifyAt = new Map<string, number>();
+
+  /**
+   * Loop-guard state for Pass 1 notifications. Tracks consecutive notifications
+   * sent to a (worker, task) pair while task state remains unchanged. After
+   * LOOP_GUARD_THRESHOLD identical-state notifications, further dispatches are
+   * hard-suppressed and a [LOOP-GUARD] warning is logged once. Counter resets
+   * automatically when task status or assignee transitions.
+   * Key format: `${workerId}:${taskId}`.
+   */
+  private readonly loopGuardState = new Map<
+    string,
+    { count: number; lastStateKey: string; suppressionLogged: boolean }
+  >();
 
   /**
    * Resolves once the startup background orphan recovery has completed (or
@@ -575,6 +792,16 @@ export class DispatchDaemonImpl implements DispatchDaemon {
 
   /** TTL for emitted warning deduplication keys (5 minutes). */
   private static readonly WARNING_DEDUP_TTL_MS = 5 * 60 * 1000;
+
+  /**
+   * Ticks elapsed since the last stuck-queue warn was emitted.
+   * Initialized to POSITIVE_INFINITY so the first stuck tick warns immediately
+   * (Infinity + 1 is still Infinity, which is >= any interval).
+   * Reset to POSITIVE_INFINITY when the queue is healthy so re-stuckening
+   * warns immediately again.
+   */
+  /** Tracks the last reported stuck state so we log only on transitions, never on every tick. */
+  private lastReportedStuck = false;
 
   constructor(
     api: QuarryAPI,
@@ -604,7 +831,16 @@ export class DispatchDaemonImpl implements DispatchDaemon {
     this.rateLimitTracker = createRateLimitTracker(settingsService);
     this.emitter = new EventEmitter();
     this.config = this.normalizeConfig(config);
+    this.healthMonitor = createHealthMonitor(
+      api,
+      inboxService,
+      sessionManager,
+      agentRegistry,
+      operationLog
+    );
   }
+
+  private readonly healthMonitor: HealthMonitor;
 
   // ----------------------------------------
   // Prompt Template Helpers
@@ -712,6 +948,99 @@ export class DispatchDaemonImpl implements DispatchDaemon {
 
   isRunning(): boolean {
     return this.running;
+  }
+
+  // ----------------------------------------
+  // Health
+  // ----------------------------------------
+
+  async getDispatchHealth(): Promise<DispatchHealth> {
+    const readyTasks = await this.api.ready({ includeEphemeral: true });
+    const readyUnassignedTasks = readyTasks.filter(t => !t.assignee).length;
+
+    const allAgents = await this.agentRegistry.listAgents();
+    const availableWorkers = allAgents.filter(a => {
+      const meta = getAgentMetadata(a);
+      if (!meta || meta.agentRole !== 'worker') return false;
+      if (isAgentDisabled(a)) return false;
+      if (meta.sessionStatus === 'terminated') return false;
+      return true;
+    }).length;
+
+    const stuck = readyUnassignedTasks > 0 && availableWorkers === 0;
+
+    // pollStale catches two failure modes:
+    // 1) A cycle is currently in flight (startedAt exists and is newer than
+    //    completedAt, or completedAt doesn't exist at all) and has been
+    //    running for longer than the threshold. This is the wedged-mid-await
+    //    case observed in production.
+    // 2) No cycle is in flight, but the last completed cycle is older than
+    //    the threshold (i.e. setInterval stopped firing entirely — rarer,
+    //    since a frozen event loop would also stop responding to HTTP).
+    // If neither timestamp is set, pollStale stays false to avoid false-firing
+    // on a just-started daemon that hasn't had a chance to poll yet.
+    let pollStale = false;
+    const now = Date.now();
+    const threshold = this.config.pollStaleThresholdMs;
+    const startedAtMs = this.lastPollStartedAt
+      ? new Date(this.lastPollStartedAt).getTime()
+      : undefined;
+    const completedAtMs = this.lastPollCompletedAt
+      ? new Date(this.lastPollCompletedAt).getTime()
+      : undefined;
+    const cycleInFlight = startedAtMs !== undefined
+      && (completedAtMs === undefined || startedAtMs > completedAtMs);
+    if (cycleInFlight && startedAtMs !== undefined) {
+      pollStale = now - startedAtMs > threshold;
+    } else if (completedAtMs !== undefined) {
+      pollStale = now - completedAtMs > threshold;
+    }
+
+    return {
+      readyUnassignedTasks,
+      availableWorkers,
+      stuck,
+      hasStuckQueue: stuck,
+      computedAt: new Date().toISOString(),
+      lastPollStartedAt: this.lastPollStartedAt,
+      lastPollCompletedAt: this.lastPollCompletedAt,
+      pollStale,
+    };
+  }
+
+  async tick(): Promise<void> {
+    await this.runPollCycle();
+  }
+
+  /**
+   * Logs ONLY on stuck-queue state transitions, never repeats while the state holds.
+   * Healthy → Stuck: emits a single STUCK warn line.
+   * Stuck → Healthy: emits a single RESUMED info line.
+   * No periodic reminders, so a long-running stuck state does not spam logs.
+   */
+  private async maybeLogStuckQueueWarning(): Promise<void> {
+    let health: DispatchHealth;
+    try {
+      health = await this.getDispatchHealth();
+    } catch {
+      // Health computation must never crash the tick loop.
+      return;
+    }
+
+    if (health.stuck && !this.lastReportedStuck) {
+      const log = this.config.logger ?? logger;
+      log.warn(
+        `[dispatch] STUCK: ${health.readyUnassignedTasks} task(s) ready, no available workers. Register or enable a worker so dispatch can proceed.`
+      );
+      this.lastReportedStuck = true;
+    } else if (!health.stuck && this.lastReportedStuck) {
+      const log = this.config.logger ?? logger;
+      const info = log.info ?? log.warn;
+      info(
+        `[dispatch] RESUMED: ${health.availableWorkers} worker(s) available, dispatch flowing again.`
+      );
+      this.lastReportedStuck = false;
+    }
   }
 
   // ----------------------------------------
@@ -1210,10 +1539,48 @@ export class DispatchDaemonImpl implements DispatchDaemon {
     this.emitter.emit('poll:start', 'orphan-recovery');
 
     try {
-      // 1. Get all ephemeral workers
+      // Phase 0: Recover orphaned director sessions.
+      // Directors have no auto-recovery path: pollWorkerAvailability skips them
+      // (not workers), and Phase 1 below is worker-only. When a director's
+      // session terminates (context-window exhaustion, process crash, or service
+      // restart without clean shutdown), sessionStatus stays 'running' or flips
+      // to 'idle'. Either way, no persistent worker receives new task assignments
+      // — the whole system stalls until the director is manually restarted.
+      // Detect and respawn here so the system is self-healing.
+      const directors = await this.agentRegistry.listAgents({ role: 'director' });
+      for (const director of directors) {
+        if (isAgentDisabled(director)) continue;
+        const directorId = asEntityId(director.id);
+        // getActiveSession performs PID liveness check and calls cleanupDeadSession
+        // if the process is gone, which resets sessionStatus to 'idle'.
+        const activeSession = this.sessionManager.getActiveSession(directorId);
+        if (activeSession) continue;
+        try {
+          const spawned = await this.spawnDirectorSession(director);
+          if (spawned) {
+            processed++;
+            logger.info(`[orphan-recovery] Respawned director ${director.name} — session had terminated`);
+            this.operationLog?.write('info', 'recovery', `Respawned director ${director.name}`, { agentId: directorId });
+          }
+        } catch (error) {
+          errors++;
+          const errorMessage = error instanceof Error ? error.message : String(error);
+          errorMessages.push(`Director ${director.name}: ${errorMessage}`);
+          logger.error(`[orphan-recovery] Error respawning director ${director.name}:`, error);
+          this.operationLog?.write('error', 'recovery', `Failed to respawn director ${director.name}: ${errorMessage}`, { agentId: directorId });
+        }
+      }
+
+      // 1. Get all workers (both ephemeral and persistent).
+      // Persistent workers are excluded from pollWorkerAvailability (they
+      // should not auto-claim from the unassigned queue), but they still need
+      // orphan recovery: when a director assigns them a task and they have no
+      // active session, the daemon must spawn one. Without this, persistent
+      // workers sit idle indefinitely waiting for an inbox message that never
+      // arrives, since processPersistentAgentMessage only forwards to existing
+      // sessions.
       const workers = await this.agentRegistry.listAgents({
         role: 'worker',
-        workerMode: 'ephemeral',
       });
 
       // Track recovery stewards assigned during this cycle to prevent cascade assignment.
@@ -1248,7 +1615,12 @@ export class DispatchDaemonImpl implements DispatchDaemon {
         }
 
         // 4. Check if the task is stuck in a resume loop
-        const taskAssignment = workerTasks[0];
+        // Sort by priority ascending (lower number = higher priority) so the
+        // highest-priority assigned task is always recovered first.
+        const sortedWorkerTasks = [...workerTasks].sort(
+          (a, b) => (a.task.priority ?? 99) - (b.task.priority ?? 99)
+        );
+        const taskAssignment = sortedWorkerTasks[0];
         let resumeCount = taskAssignment.orchestratorMeta?.resumeCount ?? 0;
         const maxResumes = this.config.maxResumeAttemptsBeforeRecovery;
 
@@ -1554,10 +1926,20 @@ export class DispatchDaemonImpl implements DispatchDaemon {
     this.emitter.emit('poll:start', 'closed-unmerged-reconciliation');
 
     try {
-      // Find tasks that are CLOSED but have a non-merged mergeStatus
+      // Only reconcile tasks closed while the steward was *actively* merging ('testing',
+      // 'merging'). These represent a genuine mid-merge interruption (daemon restart, race
+      // condition) that warrants a retry.
+      //
+      // Explicitly excluded states:
+      // - 'pending': the steward had not yet started. Any close at this point is an
+      //   operator decision (e.g., Director closes after Tester PASS, or task superseded).
+      //   The compound of Bug 5 (stale assignedAgent) + Bug 8 (pending resurrection)
+      //   causes agents to receive stale dispatches on already-closed work.
+      // - 'failed', 'conflict', 'test_failed': terminal failure states; the steward already
+      //   gave up and an operator close is intentional.
       const stuckTasks = await this.taskAssignment.listAssignments({
         taskStatus: [TaskStatus.CLOSED],
-        mergeStatus: ['pending', 'testing', 'merging', 'conflict', 'test_failed', 'failed'],
+        mergeStatus: ['testing', 'merging'],
       });
 
       const now = Date.now();
@@ -1916,7 +2298,7 @@ export class DispatchDaemonImpl implements DispatchDaemon {
   // Configuration
   // ----------------------------------------
 
-  getConfig(): Omit<Required<DispatchDaemonConfig>, 'onSessionStarted'> & { onSessionStarted?: OnSessionStartedCallback } {
+  getConfig(): Omit<Required<DispatchDaemonConfig>, 'onSessionStarted' | 'logger'> & { onSessionStarted?: OnSessionStartedCallback; logger?: { warn: (...args: unknown[]) => void } } {
     return { ...this.config };
   }
 
@@ -2006,8 +2388,15 @@ export class DispatchDaemonImpl implements DispatchDaemon {
     let pollIntervalMs = config?.pollIntervalMs ?? DISPATCH_DAEMON_DEFAULT_POLL_INTERVAL_MS;
     pollIntervalMs = Math.max(DISPATCH_DAEMON_MIN_POLL_INTERVAL_MS, Math.min(DISPATCH_DAEMON_MAX_POLL_INTERVAL_MS, pollIntervalMs));
 
+    // Default staleness threshold: max(60s, 10× poll interval). 60s is well
+    // above any healthy cycle's expected duration; 10× protects users running
+    // with a custom long pollIntervalMs.
+    const pollStaleThresholdMs = config?.pollStaleThresholdMs
+      ?? Math.max(60_000, 10 * pollIntervalMs);
+
     return {
       pollIntervalMs,
+      pollStaleThresholdMs,
       workerAvailabilityPollEnabled: config?.workerAvailabilityPollEnabled ?? true,
       inboxPollEnabled: config?.inboxPollEnabled ?? true,
       stewardTriggerPollEnabled: config?.stewardTriggerPollEnabled ?? true,
@@ -2020,13 +2409,20 @@ export class DispatchDaemonImpl implements DispatchDaemon {
       stuckMergeRecoveryEnabled: config?.stuckMergeRecoveryEnabled ?? true,
       stuckMergeRecoveryGracePeriodMs: config?.stuckMergeRecoveryGracePeriodMs ?? 600_000,
       maxResumeAttemptsBeforeRecovery: config?.maxResumeAttemptsBeforeRecovery ?? 3,
+      healthMonitorEnabled: config?.healthMonitorEnabled ?? true,
+      goalDirectiveEnabled: config?.goalDirectiveEnabled ?? false,
       maxSessionDurationMs: config?.maxSessionDurationMs ?? 0,
       maxStewardSessionDurationMs: config?.maxStewardSessionDurationMs ?? 30 * 60 * 1000,
+      idleWorkerSessionThresholdMs: config?.idleWorkerSessionThresholdMs ?? 30 * 60 * 1000,
+      idleWorkerSessionReapEnabled: config?.idleWorkerSessionReapEnabled ?? true,
+      persistentWorkerSessionEnsureEnabled: config?.persistentWorkerSessionEnsureEnabled ?? true,
+      persistentWorkerDispatchEnabled: config?.persistentWorkerDispatchEnabled ?? true,
       onSessionStarted: config?.onSessionStarted,
       projectRoot: config?.projectRoot ?? process.cwd(),
       directorInboxForwardingEnabled: config?.directorInboxForwardingEnabled ?? true,
       directorInboxIdleThresholdMs: config?.directorInboxIdleThresholdMs ?? 120_000,
       ensureTargetBranchExists: config?.ensureTargetBranchExists ?? ensureTargetBranchExists,
+      logger: config?.logger,
     };
   }
 
@@ -2036,6 +2432,7 @@ export class DispatchDaemonImpl implements DispatchDaemon {
   private async runPollCycle(): Promise<void> {
     if (this.polling) return;
     this.polling = true;
+    this.lastPollStartedAt = createTimestamp();
     try {
       // Check if dispatch is paused due to rate limiting.
       // When paused, skip dispatch-related polls but still run non-dispatch work.
@@ -2079,6 +2476,13 @@ export class DispatchDaemonImpl implements DispatchDaemon {
         this.rateLimitSleepTimer = undefined;
       }
 
+      // Reap idle persistent worker sessions before orphan recovery so that
+      // sessions stuck in bad state (e.g. lost auth) are killed first, making
+      // them immediately eligible for respawn in the same cycle.
+      if (this.config.idleWorkerSessionReapEnabled) {
+        await this.reapIdlePersistentWorkerSessions();
+      }
+
       // Recover orphaned assignments first — workers with tasks but no session
       // (e.g. from mid-cycle crashes). Runs before availability polling so
       // orphans are handled before they'd be skipped.
@@ -2090,14 +2494,31 @@ export class DispatchDaemonImpl implements DispatchDaemon {
         await this.recoverOrphanedAssignments();
       }
 
+      // Ensure every persistent worker has a session. Runs after orphan recovery
+      // so task-specific sessions (worktree + task prompt) take precedence; this
+      // only fires for workers that orphan recovery skipped (e.g. all tasks in
+      // review, or no tasks at all). Without this, workers that survive a restart
+      // with all tasks in review never get sessions and can't receive new inbox
+      // messages.
+      if (this.config.persistentWorkerSessionEnsureEnabled) {
+        await this.ensurePersistentWorkerSessions();
+      }
+
       // Reap stale sessions before polling for availability
       await this.reapStaleSessions();
 
       // Run polls sequentially to avoid overwhelming the system.
       // Inbox runs first so triage spawns before task dispatch — idle agents
       // process accumulated non-dispatch messages before picking up new tasks.
+      // pollPersistentWorkerDispatch runs after pollInboxes so that workers
+      // appear idle only after any pending dispatch-ack messages have been
+      // processed; stale unread items would otherwise make a worker look busy.
       if (this.config.inboxPollEnabled) {
         await this.pollInboxes();
+      }
+
+      if (this.config.persistentWorkerDispatchEnabled) {
+        await this.pollPersistentWorkerDispatch();
       }
 
       if (this.config.workerAvailabilityPollEnabled) {
@@ -2133,7 +2554,22 @@ export class DispatchDaemonImpl implements DispatchDaemon {
       if (this.config.workflowAutoTransitionEnabled) {
         await this.pollWorkflowAutoTransition();
       }
+
+      // Health monitor: detect worker auth-loss, self-addressed pings, and
+      // repeat-identical dispatches. Surfaces findings to Director.
+      // Detection-only — never modifies task state or stops agents.
+      if (this.config.healthMonitorEnabled) {
+        try {
+          await this.healthMonitor.poll();
+        } catch (err) {
+          logger.warn('[health-monitor] poll cycle failed:', err);
+          // Non-fatal: health monitor failures must not block other poll work
+        }
+      }
+
+      await this.maybeLogStuckQueueWarning();
     } finally {
+      this.lastPollCompletedAt = createTimestamp();
       this.polling = false;
     }
   }
@@ -2200,6 +2636,65 @@ export class DispatchDaemonImpl implements DispatchDaemon {
    * - `maxStewardSessionDurationMs` — stricter limit for steward sessions
    *   (default 30 minutes), which are expected to be short-lived
    */
+  /**
+   * Kills persistent worker sessions that have been idle too long while they
+   * have pending work (assigned tasks or unread inbox items). Orphan recovery,
+   * which runs in the same cycle immediately after, respawns them with a fresh
+   * context.
+   *
+   * The canonical trigger is a session whose Claude process lost authentication
+   * ("Not logged in") — the process is alive so orphan recovery would skip it,
+   * but it will never make progress. Activity-timeout detection catches this
+   * and any other silent-stall pattern without requiring PTY output parsing.
+   */
+  async reapIdlePersistentWorkerSessions(): Promise<void> {
+    const thresholdMs = this.config.idleWorkerSessionThresholdMs;
+    const now = Date.now();
+
+    const workers = await this.agentRegistry.listAgents({
+      role: 'worker',
+      workerMode: 'persistent',
+    });
+
+    for (const worker of workers) {
+      if (isAgentDisabled(worker)) continue;
+
+      const workerId = asEntityId(worker.id);
+      const session = this.sessionManager.getActiveSession(workerId);
+      if (!session || session.status !== 'running') continue;
+
+      const lastActivity = new Date(session.lastActivityAt).getTime();
+      const idleMs = now - lastActivity;
+      if (idleMs < thresholdMs) continue;
+
+      // Only reap when there is work waiting — idle-but-empty sessions are fine.
+      const [workerTasks, inboxItems] = await Promise.all([
+        this.taskAssignment.getAgentTasks(workerId, {
+          taskStatus: [TaskStatus.OPEN, TaskStatus.IN_PROGRESS],
+        }),
+        Promise.resolve(
+          this.inboxService.getInbox(workerId, { status: InboxStatus.UNREAD, limit: 1 })
+        ),
+      ]);
+
+      if (workerTasks.length === 0 && inboxItems.length === 0) continue;
+
+      const idleMin = Math.round(idleMs / 60_000);
+      const reason = `Idle session with pending work — ${idleMin}m since last activity. Respawning for fresh context.`;
+      logger.warn(`[idle-worker-reap] ${worker.name}: ${reason}`);
+      this.operationLog?.write('warn', 'recovery', reason, { agentId: workerId });
+
+      try {
+        await this.sessionManager.stopSession(session.id, { graceful: false, reason });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!message.includes('not found')) {
+          logger.warn(`[idle-worker-reap] Failed to stop session for ${worker.name}:`, error);
+        }
+      }
+    }
+  }
+
   private async reapStaleSessions(): Promise<void> {
     const hasGeneralLimit = this.config.maxSessionDurationMs > 0;
     const hasStewardLimit = this.config.maxStewardSessionDurationMs > 0;
@@ -2994,9 +3489,29 @@ export class DispatchDaemonImpl implements DispatchDaemon {
   private async buildTaskPrompt(task: Task, workerId: EntityId): Promise<string> {
     const parts: string[] = [];
 
+    // Optional /goal directive — must be the very first line so Claude Code
+    // parses it as a slash command on session start. The goal condition is
+    // evaluated per turn by a Haiku model; we phrase it as a concrete state
+    // the worker can observably reach (closed/REVIEW or handed off).
+    if (this.config.goalDirectiveEnabled) {
+      parts.push(
+        `/goal Task ${task.id} reaches one of these terminal states: ` +
+        `(a) status is 'review' or 'closed' (worker ran sf task complete), or ` +
+        `(b) task is reassigned to a different agent (worker ran sf task handoff). ` +
+        `Verify with: sf task view ${task.id}`,
+        ''
+      );
+    }
+
+    // Look up the worker's actual mode — persistent workers must receive their
+    // own prompt (not the ephemeral one that tells them to exit after each task).
+    const workerAgent = await this.agentRegistry.getAgent(workerId);
+    const workerMeta = workerAgent ? getAgentMetadata(workerAgent) : undefined;
+    const workerMode = (workerMeta as WorkerMetadata | undefined)?.workerMode ?? 'ephemeral';
+
     // Load and include the worker role prompt, framed as operating instructions
     // so Claude understands this is its role definition, not file content
-    const roleResult = loadRolePrompt('worker', undefined, { projectRoot: this.config.projectRoot, workerMode: 'ephemeral' });
+    const roleResult = loadRolePrompt('worker', undefined, { projectRoot: this.config.projectRoot, workerMode });
     if (roleResult) {
       parts.push(
         'Please read and internalize the following operating instructions. These define your role and how you should behave:',
@@ -3064,6 +3579,321 @@ export class DispatchDaemonImpl implements DispatchDaemon {
     );
 
     return parts.join('\n');
+  }
+
+  /**
+  /**
+   * Spawns a new session for a director whose session has terminated.
+   * Mirrors the prompt-framing logic in the sessions route so the director
+   * receives the same role prompt and identity injection it would from `sf agent start`.
+   */
+  private async spawnDirectorSession(director: AgentEntity): Promise<boolean> {
+    const directorId = asEntityId(director.id);
+
+    // Double-check: a concurrent poll cycle may have already spawned this director.
+    const existing = this.sessionManager.getActiveSession(directorId);
+    if (existing) return false;
+
+    const roleResult = loadRolePrompt('director', undefined, { projectRoot: this.config.projectRoot });
+    let initialPrompt: string;
+
+    if (roleResult?.prompt) {
+      const framedRole =
+        `Please read and internalize the following operating instructions. ` +
+        `These define your role and how you should behave in this session:\n\n${roleResult.prompt}`;
+      const idSection = `\n\n**Director ID:** ${directorId}`;
+      const presetSection = this.buildWorkflowPresetContextSection();
+      const presetBlock = presetSection ? `\n\n${presetSection}` : '';
+      initialPrompt = `${framedRole}${idSection}${presetBlock}`;
+    } else {
+      initialPrompt = `**Director ID:** ${directorId}`;
+    }
+
+    await this.sessionManager.startSession(directorId, {
+      workingDirectory: this.config.projectRoot,
+      initialPrompt,
+    });
+
+    return true;
+  }
+
+  /**
+   * Ensures every non-disabled persistent worker has an active session.
+   *
+   * Orphan recovery only spawns task-specific sessions for workers whose tasks
+   * are in OPEN or IN_PROGRESS status. After a restart where all of a worker's
+   * tasks have moved to `review` (or the worker has no tasks at all), orphan
+   * recovery silently skips that worker and no session is spawned. The worker
+   * then can't receive inbox messages from the director.
+   *
+   * This method runs after orphan recovery so task-specific sessions take
+   * precedence; it only fires for workers that still have no session after
+   * orphan recovery.
+   */
+  async ensurePersistentWorkerSessions(): Promise<void> {
+    const workers = await this.agentRegistry.listAgents({
+      role: 'worker',
+      workerMode: 'persistent',
+    });
+
+    for (const worker of workers) {
+      if (isAgentDisabled(worker)) continue;
+
+      const workerId = asEntityId(worker.id);
+      const session = this.sessionManager.getActiveSession(workerId);
+      if (session) continue;
+
+      const executableCheck = this.resolveExecutableWithFallback(worker);
+      if (executableCheck === 'all_limited') {
+        logger.debug(
+          `[ensure-persistent-sessions] All executables rate-limited for ${worker.name}, skipping`
+        );
+        continue;
+      }
+
+      try {
+        const roleResult = loadRolePrompt('worker', undefined, {
+          projectRoot: this.config.projectRoot,
+          workerMode: 'persistent',
+        });
+
+        let initialPrompt: string;
+        if (roleResult?.prompt) {
+          const framedRole =
+            'Please read and internalize the following operating instructions. ' +
+            'These define your role and how you should behave in this session:\n\n' +
+            roleResult.prompt;
+          const idSection = `\n\n**Worker ID:** ${workerId}`;
+          const presetSection = this.buildWorkflowPresetContextSection();
+          const presetBlock = presetSection ? `\n\n${presetSection}` : '';
+          initialPrompt = `${framedRole}${idSection}${presetBlock}`;
+        } else {
+          initialPrompt = `**Worker ID:** ${workerId}`;
+        }
+
+        const { session: newSession, events } = await this.sessionManager.startSession(workerId, {
+          workingDirectory: this.config.projectRoot,
+          initialPrompt,
+          executablePathOverride: executableCheck ?? undefined,
+        });
+
+        if (this.config.onSessionStarted) {
+          this.config.onSessionStarted(newSession, events, workerId, initialPrompt);
+        }
+
+        this.emitter.emit('agent:spawned', workerId, this.config.projectRoot);
+        logger.info(`[ensure-persistent-sessions] Spawned standby session for ${worker.name}`);
+        this.operationLog?.write('info', 'recovery', `Spawned standby session for persistent worker ${worker.name}`, { agentId: workerId });
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        logger.warn(`[ensure-persistent-sessions] Failed to spawn session for ${worker.name}: ${errorMessage}`);
+      }
+    }
+  }
+
+  async pollPersistentWorkerDispatch(): Promise<PollResult> {
+    const startedAt = new Date().toISOString();
+    const startTime = Date.now();
+    let processed = 0;
+    let errors = 0;
+    const errorMessages: string[] = [];
+
+    this.emitter.emit('poll:start', 'persistent-worker-dispatch');
+
+    try {
+      const workers = await this.agentRegistry.listAgents({
+        role: 'worker',
+        workerMode: 'persistent',
+      });
+
+      // Pass 1: Notify workers about pre-assigned OPEN tasks they haven't started.
+      // Covers tasks assigned via `sf task assign`, `sf task handoff --to`, or Director
+      // dispatch that bypassed the daemon. Cooldown is per-(worker, task) at 5 minutes:
+      // long enough that a worker won't be spammed about the same task on every poll,
+      // short enough that a stuck task gets a periodic reminder. A per-worker cooldown
+      // would suppress notifications for legitimately-new assignments after a recent ping.
+      const NOTIFY_COOLDOWN_MS = 300_000; // 5 minutes
+      for (const worker of workers) {
+        if (isAgentDisabled(worker)) continue;
+        const workerId = asEntityId(worker.id);
+        const activeSession = this.sessionManager.getActiveSession(workerId);
+        if (!activeSession) continue; // No session to notify
+
+        const openTasks = await this.taskAssignment.getAgentTasks(workerId, {
+          taskStatus: [TaskStatus.OPEN],
+        });
+        if (openTasks.length === 0) continue; // No OPEN tasks assigned
+
+        const assignment = openTasks[0];
+        const cooldownKey = `${workerId}:${assignment.taskId}`;
+        const lastNotify = this.lastPreAssignedNotifyAt.get(cooldownKey) ?? 0;
+        if (Date.now() - lastNotify < NOTIFY_COOLDOWN_MS) continue; // Same-task cooldown active
+
+        // If the canonical assignee (task.assignee) differs from the metadata's
+        // assignedAgent, the task was re-routed via sf task assign (quarry) without
+        // updating orchestratorMeta. Re-sync now so the worker receives the correct
+        // branch/worktree and doesn't inherit a stale branch pre-allocated for a
+        // different agent (Bug 5 — metadata.branch speculatively pre-allocated).
+        if (assignment.orchestratorMeta?.assignedAgent !== workerId) {
+          try {
+            await this.taskAssignment.assignToAgent(assignment.taskId, workerId);
+            logger.info(
+              `[persistent-worker-dispatch] Resynced stale metadata for ${assignment.taskId}: ` +
+              `assignedAgent was ${String(assignment.orchestratorMeta?.assignedAgent)}, now ${worker.name}`
+            );
+          } catch (syncError) {
+            logger.warn(
+              `[persistent-worker-dispatch] Metadata resync failed for ${assignment.taskId}:`,
+              syncError
+            );
+            // Non-fatal: proceed with notification even if resync fails
+          }
+        }
+
+        // Loop-guard: count consecutive notifications with the task state
+        // unchanged since the last successful delivery. After threshold, hard-
+        // suppress further dispatches on this (worker, task) pair until state
+        // changes. Catches Bug 5 / Bug 9 / handoff-divergence loops where the
+        // operator has to intervene to break the cycle.
+        const stateKey = `${assignment.task.status}|${String(assignment.task.assignee)}`;
+        const guardEntry = this.loopGuardState.get(cooldownKey);
+        if (guardEntry && guardEntry.lastStateKey === stateKey && guardEntry.count >= LOOP_GUARD_THRESHOLD) {
+          if (!guardEntry.suppressionLogged) {
+            logger.warn(
+              `[LOOP-GUARD] Suppressed dispatch to ${worker.name} on ${assignment.taskId} after ${guardEntry.count} ` +
+              `consecutive notifications without state change. Likely Bug 5/Bug 9 divergence; operator action required ` +
+              `(sf task close or sf task assign).`
+            );
+            guardEntry.suppressionLogged = true;
+            this.loopGuardState.set(cooldownKey, guardEntry);
+          }
+          continue;
+        }
+
+        const notice = `**Task assigned to you:** ${assignment.task.title} (${assignment.taskId})\n\nCheck your task list with \`sf task list --assignee ${workerId}\` and begin working on this task now.`;
+        const deliveryResult = await this.sessionManager.messageSession(activeSession.id, {
+          content: notice,
+          // senderId omitted on purpose — defaults to 'system' inside messageSession.
+          // Setting senderId to workerId here would make the message appear as if it
+          // came FROM the recipient TO themselves, producing the visible self-ping loop.
+        });
+        if (deliveryResult.success) {
+          this.lastPreAssignedNotifyAt.set(cooldownKey, Date.now());
+          // Update loop-guard counter
+          const prev = this.loopGuardState.get(cooldownKey);
+          if (prev && prev.lastStateKey === stateKey) {
+            this.loopGuardState.set(cooldownKey, { ...prev, count: prev.count + 1 });
+          } else {
+            this.loopGuardState.set(cooldownKey, { count: 1, lastStateKey: stateKey, suppressionLogged: false });
+          }
+          logger.info(`[persistent-worker-dispatch] Notified ${worker.name} about pre-assigned task ${assignment.taskId}`);
+        }
+      }
+
+      // Snapshot unassigned ready tasks once before the loop so all workers see
+      // the same queue. Dispatching removes items from this local list via
+      // shift(), matching the pollWorkflowTasks pattern (sortedReviewTasks.shift()).
+      // Calling api.ready() per-worker would open a race window where two workers
+      // could each see the same task before either dispatch() commits.
+      const readyTasks = await this.api.ready({ includeEphemeral: true });
+      const unassigned = readyTasks.filter((t) => !t.assignee);
+
+      for (const worker of workers) {
+        if (isAgentDisabled(worker)) continue;
+
+        const workerId = asEntityId(worker.id);
+
+        // Skip if worker has active tasks (open or in_progress)
+        const activeTasks = await this.taskAssignment.getAgentTasks(workerId, {
+          taskStatus: [TaskStatus.OPEN, TaskStatus.IN_PROGRESS],
+        });
+        if (activeTasks.length > 0) continue;
+
+        // Skip if worker already has an unread inbox item (dispatch in flight)
+        const unread = this.inboxService.getInbox(workerId, {
+          status: InboxStatus.UNREAD,
+          limit: 1,
+        });
+        if (unread.length > 0) continue;
+
+        // Queue is drained — no point checking remaining workers.
+        // break is correct here (not continue): all subsequent workers would also
+        // find an empty queue.
+        if (unassigned.length === 0) break;
+
+        const execCheck = this.resolveExecutableWithFallback(worker);
+        if (execCheck === 'all_limited') {
+          logger.debug(
+            `[persistent-worker-dispatch] All executables rate-limited for ${worker.name}, skipping`
+          );
+          continue;
+        }
+
+        const task = unassigned[0];
+
+        // Re-check: another concurrent operation (Director, CLI) may have
+        // assigned this task between the api.ready() snapshot and now.
+        const freshTask = await this.api.get<Task>(task.id as unknown as ElementId);
+        if (freshTask?.assignee) {
+          logger.debug(`[persistent-worker-dispatch] Task ${task.id} was assigned concurrently, skipping`);
+          unassigned.shift(); // Remove from snapshot so next worker doesn't try again
+          continue;
+        }
+
+        try {
+          await this.dispatchService.dispatch(task.id, workerId, {
+            markAsStarted: false,
+          });
+          unassigned.shift();
+          this.emitter.emit('task:dispatched', task.id, workerId);
+          logger.info(
+            `[persistent-worker-dispatch] Dispatched task ${task.id} ("${task.title}") to ${worker.name}`
+          );
+          this.operationLog?.write('info', 'dispatch', `Auto-dispatched task ${task.id} to persistent worker ${worker.name}`, { taskId: task.id, agentId: workerId });
+          processed++;
+
+          // dispatchService.dispatch() uses suppressInbox: true so the notification
+          // won't reach the worker via pollInboxes. Directly message the active
+          // session instead — same mechanism as processPersistentAgentMessage.
+          const activeSession = this.sessionManager.getActiveSession(workerId);
+          if (activeSession) {
+            const notice = `**Task dispatched to you:** ${task.title} (${task.id})\n\nCheck your task list with \`sf task list --assignee ${workerId}\` and begin working on this task now.`;
+            const deliveryResult = await this.sessionManager.messageSession(activeSession.id, {
+              content: notice,
+              // senderId omitted — same reason as the Pass 1 self-ping fix above.
+            });
+            if (!deliveryResult.success) {
+              logger.warn(
+                `[persistent-worker-dispatch] Session message to ${worker.name} failed: ${deliveryResult.error}. Worker will see task on next inbox poll.`
+              );
+            }
+          }
+        } catch (error) {
+          errors++;
+          const errorMessage = error instanceof Error ? error.message : String(error);
+          errorMessages.push(`Worker ${worker.name}: ${errorMessage}`);
+          logger.error(`[persistent-worker-dispatch] Failed to dispatch task ${task.id} to ${worker.name}:`, error);
+          this.operationLog?.write('warn', 'dispatch', `Failed to dispatch task ${task.id} to persistent worker ${worker.name}: ${errorMessage}`, { taskId: task.id, agentId: workerId });
+        }
+      }
+    } catch (error) {
+      errors++;
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      errorMessages.push(errorMessage);
+      logger.error('Error in pollPersistentWorkerDispatch:', error);
+    }
+
+    const result: PollResult = {
+      pollType: 'persistent-worker-dispatch',
+      startedAt,
+      durationMs: Date.now() - startTime,
+      processed,
+      errors,
+      errorMessages: errorMessages.length > 0 ? errorMessages : undefined,
+    };
+
+    this.emitter.emit('poll:complete', result);
+    return result;
   }
 
   /**
@@ -3171,12 +4001,13 @@ export class DispatchDaemonImpl implements DispatchDaemon {
     // Include sync status section if sync was attempted
     if (syncResult) {
       parts.push('', '## Sync Status', '');
-      parts.push('The branch was synced with master before your review.', '');
+      const syncTargetBranch = getValue('merge.targetBranch') as string | null | undefined ?? 'master';
+      parts.push(`The branch was synced with ${syncTargetBranch} before your review.`, '');
 
       if (syncResult.success) {
         parts.push('**Result**: SUCCESS');
         parts.push('');
-        parts.push('Branch is up-to-date with master. `git diff origin/master..HEAD` will show only this task\'s changes.');
+        parts.push(`Branch is up-to-date with ${syncTargetBranch}. \`git diff origin/${syncTargetBranch}..HEAD\` will show only this task's changes.`);
       } else if (syncResult.conflicts && syncResult.conflicts.length > 0) {
         parts.push('**Result**: CONFLICTS');
         parts.push('');
@@ -3854,10 +4685,20 @@ export class DispatchDaemonImpl implements DispatchDaemon {
       try {
         // In session -> forward as user input
         const forwardedContent = await this.formatForwardedMessage(message);
-        await this.sessionManager.messageSession(activeSession.id, {
+        const deliveryResult = await this.sessionManager.messageSession(activeSession.id, {
           content: forwardedContent,
           senderId: message.sender,
         });
+
+        if (!deliveryResult.success) {
+          // PTY write failed (buffer full, session degraded, etc.) — leave inbox
+          // item unread so it can be retried on the next poll cycle. The
+          // idle-reaper will kill and respawn the session if it stays stuck.
+          logger.warn(
+            `Failed to forward inbox message ${item.id} to ${agent.name} (session ${activeSession.id}): ${deliveryResult.error}`
+          );
+          return false;
+        }
 
         this.inboxService.markAsRead(item.id);
         this.emitter.emit('message:forwarded', message.id, agentId);
@@ -4195,8 +5036,13 @@ export class DispatchDaemonImpl implements DispatchDaemon {
       };
     }
 
-    // Get default branch
-    const defaultBranch = await this.worktreeManager.getDefaultBranch();
+    // Resolve the target branch using the same priority order as task dispatch:
+    // task metadata → workspace config → git detection.
+    // Previously this called worktreeManager.getDefaultBranch() which only does
+    // git detection and always resolves to master, ignoring merge.targetBranch.
+    const targetBranchFromMeta = orchestratorMeta?.targetBranch as string | undefined;
+    const configuredTargetBranch = getValue('merge.targetBranch') as string | null | undefined;
+    const defaultBranch = targetBranchFromMeta ?? configuredTargetBranch ?? await this.worktreeManager.getDefaultBranch();
     const remoteBranch = `origin/${defaultBranch}`;
 
     // Attempt to merge
