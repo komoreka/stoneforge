@@ -62,6 +62,7 @@ import {
   type TaskSessionHistoryEntry,
 } from '../types/task-meta.js';
 import type { OperationLogService } from './operation-log-service.js';
+import { HealthMonitor, createHealthMonitor } from './health-monitor.js';
 
 const logger = createLogger('dispatch-daemon');
 
@@ -268,6 +269,21 @@ export interface DispatchDaemonConfig {
   readonly maxResumeAttemptsBeforeRecovery?: number;
 
   /**
+   * When true, the daemon runs an in-process HealthMonitor on each poll
+   * cycle. The monitor detects worker auth-loss (PTY output containing
+   * /login markers), self-addressed daemon pings (GUARD-1 regression
+   * sentinel), and repeat-identical dispatches (Bug 5 / Bug 9 signature).
+   * Findings surface to the Director via session message + operation log,
+   * throttled per (agentId, issueType) to one notification per 10 minutes.
+   *
+   * Detection only — does not auto-close tasks, stop agents, or modify
+   * orchestrator metadata.
+   *
+   * Default: true
+   */
+  readonly healthMonitorEnabled?: boolean;
+
+  /**
    * When true, prepend a Claude Code `/goal` directive to worker task prompts
    * so Claude auto-continues across turns until the task is closed or handed
    * off. Requires Claude Code v2.1.139+ (the version that introduced /goal).
@@ -449,6 +465,7 @@ interface NormalizedConfig {
   stuckMergeRecoveryEnabled: boolean;
   stuckMergeRecoveryGracePeriodMs: number;
   maxResumeAttemptsBeforeRecovery: number;
+  healthMonitorEnabled: boolean;
   goalDirectiveEnabled: boolean;
   maxSessionDurationMs: number;
   maxStewardSessionDurationMs: number;
@@ -814,7 +831,16 @@ export class DispatchDaemonImpl implements DispatchDaemon {
     this.rateLimitTracker = createRateLimitTracker(settingsService);
     this.emitter = new EventEmitter();
     this.config = this.normalizeConfig(config);
+    this.healthMonitor = createHealthMonitor(
+      api,
+      inboxService,
+      sessionManager,
+      agentRegistry,
+      operationLog
+    );
   }
+
+  private readonly healthMonitor: HealthMonitor;
 
   // ----------------------------------------
   // Prompt Template Helpers
@@ -2383,6 +2409,7 @@ export class DispatchDaemonImpl implements DispatchDaemon {
       stuckMergeRecoveryEnabled: config?.stuckMergeRecoveryEnabled ?? true,
       stuckMergeRecoveryGracePeriodMs: config?.stuckMergeRecoveryGracePeriodMs ?? 600_000,
       maxResumeAttemptsBeforeRecovery: config?.maxResumeAttemptsBeforeRecovery ?? 3,
+      healthMonitorEnabled: config?.healthMonitorEnabled ?? true,
       goalDirectiveEnabled: config?.goalDirectiveEnabled ?? false,
       maxSessionDurationMs: config?.maxSessionDurationMs ?? 0,
       maxStewardSessionDurationMs: config?.maxStewardSessionDurationMs ?? 30 * 60 * 1000,
@@ -2526,6 +2553,18 @@ export class DispatchDaemonImpl implements DispatchDaemon {
       // Auto-transition workflows based on task statuses
       if (this.config.workflowAutoTransitionEnabled) {
         await this.pollWorkflowAutoTransition();
+      }
+
+      // Health monitor: detect worker auth-loss, self-addressed pings, and
+      // repeat-identical dispatches. Surfaces findings to Director.
+      // Detection-only — never modifies task state or stops agents.
+      if (this.config.healthMonitorEnabled) {
+        try {
+          await this.healthMonitor.poll();
+        } catch (err) {
+          logger.warn('[health-monitor] poll cycle failed:', err);
+          // Non-fatal: health monitor failures must not block other poll work
+        }
       }
 
       await this.maybeLogStuckQueueWarning();
